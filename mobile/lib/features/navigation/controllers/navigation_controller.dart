@@ -14,6 +14,7 @@ import '../../settings/controllers/settings_controller.dart';
 import '../domain/geocoding_service.dart';
 import '../domain/location_service.dart';
 import '../domain/motion_math.dart';
+import '../domain/places_poi_service.dart';
 import '../domain/route_progress.dart';
 import '../domain/routing_service.dart';
 import 'current_place_controller.dart';
@@ -275,8 +276,23 @@ class NavigationController extends ChangeNotifier {
   // Map layer toggle: false = Standard OSM, true = OpenTopoMap
   bool _isTopoLayer = false;
 
+  // POI discovery filter selected from the idle-map chips. A null value means
+  // no POI category is currently selected.
+  PoiType? _activePoiFilter;
+
   // ── Getters ────────────────────────────────────────────────────────────────
   NavigationState get state => _state;
+
+  /// POI category currently selected for discovery, or `null` when none is
+  /// selected.
+  PoiType? get activePoiFilter => _activePoiFilter;
+
+  /// Selects [type] as the POI discovery filter, or clears it when it is
+  /// already active.
+  void togglePoiFilter(PoiType type) {
+    _activePoiFilter = _activePoiFilter == type ? null : type;
+    notifyListeners();
+  }
 
   /// Most recent good GPS fix (`accuracy <= 30 m`) used for the map dot, speed,
   /// turn progression, and off-route checks.
