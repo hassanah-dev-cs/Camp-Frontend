@@ -56,7 +56,7 @@ lib/
     ├── mechanics/                ← MechanicsHomeScreen · AddMechanicScreen
     ├── navigation/               ← NavigationMapScreen · RoutePacksScreen
     │   ├── controllers/          ← NavigationController (per-screen, not singleton)
-    │   └── domain/               ← LocationService · RoutingService · GeocodingService · PlacesPoiService
+    │   └── domain/               ← LocationService · RoutingService · GeocodingService
     ├── ride_history/             ← RideHistoryScreen
     ├── settings/                 ← SettingsScreen
     │   └── controllers/          ← SettingsController (singleton, persisted)

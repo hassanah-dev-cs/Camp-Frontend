@@ -2,6 +2,7 @@ import 'package:camp/core/storage/local_store.dart';
 import 'package:camp/core/utils/currency_formatter.dart';
 import 'package:camp/features/garage/controllers/active_bike_controller.dart';
 import 'package:camp/features/garage/domain/bike_model.dart';
+import 'package:camp/features/garage/domain/fuel_estimator.dart';
 import 'package:camp/features/garage/presentation/widgets/update_fuel_sheet.dart';
 import 'package:camp/features/maintenance/controllers/post_ride_report_controller.dart';
 import 'package:camp/features/maintenance/controllers/trip_budget_controller.dart';
@@ -893,6 +894,147 @@ void main() {
 
       // "Full tank" label appears exactly once for fullExpense
       expect(find.text('Full tank'), findsOneWidget);
+    });
+  });
+
+  group('BATCH FUEL-SHEET: Fuel Sheet Opens on Current Estimate & Honest Wording', () {
+    testWidgets(
+        '1. Fuel sheet starting value equals card estimate, shows honest wording and Last set line',
+        (tester) async {
+      // Bike setup:
+      // Saved fuel level: 9.7 L at 10000 km
+      // Current odometer: 10010 km (10 km ridden since set)
+      // Fuel average: 20 km/L -> consumed = 10 / 20 = 0.5 L
+      // Current estimate = 9.7 - 0.5 = 9.2 L
+      const testBikeWithRiddenDistance = Bike(
+        id: 'bike-fuel-sheet',
+        make: 'Yamaha',
+        modelName: 'Tenere 700',
+        modelYear: 2023,
+        fuelTankCapacityLiters: 20.0,
+        fuelRemainingLiters: 9.7,
+        fuelLevelOdometerKm: 10000.0,
+        odometerKm: 10010,
+        preciseOdometerKm: 10010.0,
+        fuelAverageKmPerLiter: 20.0,
+      );
+      ActiveBikeController.instance.addBike(testBikeWithRiddenDistance);
+      ActiveBikeController.instance.setActiveBike(testBikeWithRiddenDistance.id);
+
+      // Verify FuelEstimator (which the card uses) computes 9.2 L
+      final cardEstimate =
+          FuelEstimator.currentLiters(testBikeWithRiddenDistance);
+      expect(cardEstimate, 9.2);
+
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: Scaffold(
+            body: UpdateFuelSheet(bike: testBikeWithRiddenDistance),
+          ),
+        ),
+      );
+      await tester.pump();
+
+      // 1. Sheet starts on the current estimate (9.2 L), NOT the raw saved base (9.7 L)
+      expect(find.text('9.2 / 20 L'), findsOneWidget);
+      expect(find.text('9.7 / 20 L'), findsNothing);
+
+      // Slider value starts at 9.2
+      final slider = tester.widget<Slider>(find.byType(Slider));
+      expect(slider.value, 9.2);
+
+      // 2. Honest wording: "estimated from distance ridden" (no claim of fuel sensor)
+      expect(find.text('estimated from distance ridden'), findsOneWidget);
+
+      // 3. Last set line: "Last set: X L at N km" shows the saved values
+      expect(find.text('Last set: 9.7 L at 10000 km'), findsOneWidget);
+
+      // 4. Saving stores the chosen value (here without moving slider: 9.2 L)
+      // as the new base at the current odometer (10010 km)
+      await tester.tap(find.text('Save Fuel Level'));
+      await tester.pump();
+
+      final updatedBike = ActiveBikeController.instance.activeBike!;
+      expect(updatedBike.fuelRemainingLiters, 9.2);
+      expect(updatedBike.fuelLevelOdometerKm, 10010.0);
+    });
+
+    testWidgets(
+        '2. Moving the slider stores the chosen value as the new base at current odometer',
+        (tester) async {
+      const bikeRidden = Bike(
+        id: 'bike-fuel-slider',
+        make: 'Honda',
+        modelName: 'Transalp',
+        modelYear: 2024,
+        fuelTankCapacityLiters: 20.0,
+        fuelRemainingLiters: 9.7,
+        fuelLevelOdometerKm: 10000.0,
+        odometerKm: 10010,
+        preciseOdometerKm: 10010.0,
+        fuelAverageKmPerLiter: 20.0,
+      );
+      ActiveBikeController.instance.addBike(bikeRidden);
+      ActiveBikeController.instance.setActiveBike(bikeRidden.id);
+
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: Scaffold(
+            body: UpdateFuelSheet(bike: bikeRidden),
+          ),
+        ),
+      );
+      await tester.pump();
+
+      expect(find.text('9.2 / 20 L'), findsOneWidget);
+      expect(find.text('Last set: 9.7 L at 10000 km'), findsOneWidget);
+
+      // Tap preset 15.0 L (75% of 20 L tank)
+      await tester.tap(find.text('15.0 L'));
+      await tester.pump();
+
+      expect(find.text('15.0 / 20 L'), findsOneWidget);
+      // Last set line remains unchanged while editing
+      expect(find.text('Last set: 9.7 L at 10000 km'), findsOneWidget);
+
+      await tester.tap(find.text('Save Fuel Level'));
+      await tester.pump();
+
+      final updatedBike = ActiveBikeController.instance.activeBike!;
+      expect(updatedBike.fuelRemainingLiters, 15.0);
+      expect(updatedBike.fuelLevelOdometerKm, 10010.0);
+    });
+
+    testWidgets(
+        '3. When fuel was never set, Last set line is hidden but honest estimate wording is present',
+        (tester) async {
+      const freshBike = Bike(
+        id: 'bike-fresh-no-fuel',
+        make: 'Suzuki',
+        modelName: 'V-Strom 650',
+        modelYear: 2022,
+        odometerKm: 8000,
+        fuelTankCapacityLiters: 20.0,
+        fuelRemainingLiters: null,
+        fuelLevelOdometerKm: null,
+      );
+      ActiveBikeController.instance.addBike(freshBike);
+      ActiveBikeController.instance.setActiveBike(freshBike.id);
+
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: Scaffold(
+            body: UpdateFuelSheet(bike: freshBike),
+          ),
+        ),
+      );
+      await tester.pump();
+
+      // "Last set:" is hidden
+      expect(find.textContaining('Last set:'), findsNothing);
+
+      // Honest wording is present
+      expect(find.text('estimated from distance ridden'), findsOneWidget);
     });
   });
 }

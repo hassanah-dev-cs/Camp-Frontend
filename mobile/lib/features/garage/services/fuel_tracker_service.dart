@@ -63,7 +63,16 @@ class FuelTrackerService extends ChangeNotifier with WidgetsBindingObserver {
 
   StreamSubscription<PositionData>? _positionSubscription;
   Timer? _throttleSaveTimer;
+  Timer? _noFixWatchdogTimer;
+  int _noFixWatchdogAttempt = 0;
+  bool _hasReceivedPositionInRide = false;
+  bool _hasNoLocationUpdates = false;
+  PositionStreamCoordinator? _attachedCoordinator;
   PositionData? _lastAcceptedPosition;
+
+  /// Timeout (15 seconds) before the tracker watchdog retries the stream without
+  /// foreground notification or marks the ride as having no location updates.
+  static const Duration watchdogTimeout = Duration(seconds: 15);
 
   bool _isRiding = false;
   double _rideDistanceKm = 0.0;
@@ -88,6 +97,10 @@ class FuelTrackerService extends ChangeNotifier with WidgetsBindingObserver {
   // ── Getters ────────────────────────────────────────────────────────────────
   bool get isRiding => _isRiding;
   double get rideDistanceKm => _rideDistanceKm;
+
+  /// True while a ride is active and zero GPS fixes have arrived after both the
+  /// initial 15 s watchdog window and the subsequent 15 s retry window.
+  bool get hasNoLocationUpdates => _isRiding && _hasNoLocationUpdates;
 
   /// Exact distance in kilometers added to the active bike's odometer during the current ride.
   double get appliedToOdometerKm => _appliedToOdometerKm;
@@ -147,6 +160,12 @@ class FuelTrackerService extends ChangeNotifier with WidgetsBindingObserver {
     _positionSubscription = null;
     _throttleSaveTimer?.cancel();
     _throttleSaveTimer = null;
+    _noFixWatchdogTimer?.cancel();
+    _noFixWatchdogTimer = null;
+    _noFixWatchdogAttempt = 0;
+    _hasReceivedPositionInRide = false;
+    _hasNoLocationUpdates = false;
+    _detachCoordinatorListener();
     _isRiding = false;
     _rideDistanceKm = 0.0;
     _appliedToOdometerKm = 0.0;
@@ -233,6 +252,9 @@ class FuelTrackerService extends ChangeNotifier with WidgetsBindingObserver {
         ? (bike.preciseOdometerKm ?? bike.odometerKm.toDouble())
         : null;
     _lastAcceptedPosition = null;
+    _hasReceivedPositionInRide = false;
+    _hasNoLocationUpdates = false;
+    _noFixWatchdogAttempt = 0;
     TrackingDiagnostics.instance.recordTrackerState('started');
 
     _subscribeToPositionStream();
@@ -270,6 +292,12 @@ class FuelTrackerService extends ChangeNotifier with WidgetsBindingObserver {
     if (!_isRiding) return;
 
     _isRiding = false;
+    _noFixWatchdogTimer?.cancel();
+    _noFixWatchdogTimer = null;
+    _noFixWatchdogAttempt = 0;
+    _hasReceivedPositionInRide = false;
+    _hasNoLocationUpdates = false;
+    _detachCoordinatorListener();
     TrackingDiagnostics.instance.recordTrackerState('stopped');
     _positionSubscription?.cancel();
     _positionSubscription = null;
@@ -302,6 +330,12 @@ class FuelTrackerService extends ChangeNotifier with WidgetsBindingObserver {
 
     // Stop stream and periodic timer synchronously first so nothing re-saves after clear.
     _isRiding = false;
+    _noFixWatchdogTimer?.cancel();
+    _noFixWatchdogTimer = null;
+    _noFixWatchdogAttempt = 0;
+    _hasReceivedPositionInRide = false;
+    _hasNoLocationUpdates = false;
+    _detachCoordinatorListener();
     _throttleSaveTimer?.cancel();
     _throttleSaveTimer = null;
     _positionSubscription?.cancel();
@@ -753,16 +787,148 @@ class FuelTrackerService extends ChangeNotifier with WidgetsBindingObserver {
     }
   }
 
-  void _subscribeToPositionStream() {
+  void _subscribeToPositionStream({bool isWatchdogRetry = false}) {
     _positionSubscription?.cancel();
+    _syncCoordinatorListener();
+    // Leave background screen-locked foreground notification disabled here
+    // (fgNotif=false) so GeolocatorLocationService never wedges on background
+    // service/wake-lock setup during foreground rides.
     _positionSubscription = _locationService
         .getPositionStream(
           highAccuracy: true,
-          enableForegroundNotification: true,
+          enableForegroundNotification: false,
           forceLocationManager:
               SettingsController.instance.gpsOnlyLocationProvider,
+          owner: LocationStreamOwner.tracker,
         )
-        .listen(handlePositionUpdate);
+        .listen(
+          handlePositionUpdate,
+          onError: _handlePositionStreamError,
+        );
+    if (!isWatchdogRetry) {
+      _noFixWatchdogAttempt = 0;
+    }
+    _armTrackerNoFixWatchdogIfNeeded();
+  }
+
+  void _syncCoordinatorListener() {
+    final service = _locationService;
+    final nextCoordinator =
+        service is GeolocatorLocationService ? service.coordinator : null;
+    if (!identical(_attachedCoordinator, nextCoordinator)) {
+      _attachedCoordinator?.removeStatusListener(_onCoordinatorStatusChanged);
+      _attachedCoordinator = nextCoordinator;
+      _attachedCoordinator?.addStatusListener(_onCoordinatorStatusChanged);
+    }
+    _onCoordinatorStatusChanged();
+  }
+
+  void _detachCoordinatorListener() {
+    _attachedCoordinator?.removeStatusListener(_onCoordinatorStatusChanged);
+    _attachedCoordinator = null;
+  }
+
+  void _onCoordinatorStatusChanged() {
+    final coord = _attachedCoordinator;
+    if (coord == null || !_isRiding) return;
+    final next = !_hasReceivedPositionInRide && coord.hasNoLocationUpdates;
+    if (_hasNoLocationUpdates != next) {
+      _hasNoLocationUpdates = next;
+      notifyListeners();
+    }
+  }
+
+  void _armTrackerNoFixWatchdogIfNeeded() {
+    _noFixWatchdogTimer?.cancel();
+    _noFixWatchdogTimer = null;
+    if (!_isRiding || _hasReceivedPositionInRide) return;
+    // When backed by GeolocatorLocationService, PositionStreamCoordinator owns
+    // the 15 s native watchdog and notifies [_onCoordinatorStatusChanged].
+    // For custom/test LocationService implementations, run the same 15 s
+    // watchdog -> one-time restart without fgNotif -> 15 s -> no-location-updates
+    // state machine here.
+    if (_locationService is GeolocatorLocationService) return;
+    _noFixWatchdogTimer = Timer(watchdogTimeout, _onTrackerWatchdogTimeout);
+  }
+
+  void _onTrackerWatchdogTimeout() {
+    if (!_isRiding || _hasReceivedPositionInRide) return;
+    final int timeoutSec = watchdogTimeout.inSeconds;
+    if (_noFixWatchdogAttempt == 0) {
+      _noFixWatchdogAttempt = 1;
+      TrackingDiagnostics.instance.recordStreamEvent(
+        action: 'watchdog',
+        owner: LocationStreamOwner.tracker.label,
+        mode: 'tracking',
+        settingsSummary:
+            'no fix within ${timeoutSec}s (restarting with fgNotif=false)',
+      );
+      _subscribeToPositionStream(isWatchdogRetry: true);
+    } else {
+      _noFixWatchdogAttempt = 2;
+      TrackingDiagnostics.instance.recordStreamEvent(
+        action: 'watchdog',
+        owner: LocationStreamOwner.tracker.label,
+        mode: 'tracking',
+        settingsSummary:
+            'no fix within ${timeoutSec}s (no location updates after retry)',
+      );
+      if (!_hasNoLocationUpdates) {
+        _hasNoLocationUpdates = true;
+        notifyListeners();
+      }
+    }
+  }
+
+  void _handlePositionStreamError(Object error, StackTrace stackTrace) {
+    if (_locationService is! GeolocatorLocationService) {
+      TrackingDiagnostics.instance.recordStreamEvent(
+        action: 'error',
+        owner: LocationStreamOwner.tracker.label,
+        mode: 'tracking',
+        settingsSummary: 'error=$error',
+      );
+    }
+  }
+
+  /// Resolves the source stream tag included on every fix log line.
+  String get _streamSourceTag {
+    final service = _locationService;
+    if (service is GeolocatorLocationService) {
+      return service.activeStreamSourceFor(LocationStreamOwner.tracker);
+    }
+    return LocationStreamOwner.tracker.label;
+  }
+
+  void _logDiagnosticFix({
+    required PositionData position,
+    required DateTime? previousAcceptedTimestamp,
+    required double? elapsedSeconds,
+    required double? distanceFromPreviousAcceptedMeters,
+    required double? previousAccuracy,
+    required bool reportedSpeedValid,
+    required double? calculatedSpeed,
+    required bool accepted,
+    required String reason,
+    double segmentMeters = 0.0,
+  }) {
+    TrackingDiagnostics.instance.recordFix(
+      timestamp: position.timestamp,
+      previousAcceptedTimestamp: previousAcceptedTimestamp,
+      elapsedSeconds: elapsedSeconds,
+      distanceFromPreviousAcceptedMeters: distanceFromPreviousAcceptedMeters,
+      previousAccuracy: previousAccuracy,
+      latitude: position.latitude,
+      longitude: position.longitude,
+      accuracy: position.accuracy,
+      speed: position.speed,
+      reportedSpeedValid: reportedSpeedValid,
+      calculatedSpeed: calculatedSpeed,
+      accepted: accepted,
+      reason: reason,
+      segmentMeters: segmentMeters,
+      streamSource: _streamSourceTag,
+    );
   }
 
   /// Restarts the active tracker GPS stream when the location provider mode changes.
@@ -792,16 +958,12 @@ class FuelTrackerService extends ChangeNotifier with WidgetsBindingObserver {
         position.speed != null && position.speed! >= minSpeedMps;
 
     if (!_isRiding) {
-      TrackingDiagnostics.instance.recordFix(
-        timestamp: position.timestamp,
+      _logDiagnosticFix(
+        position: position,
         previousAcceptedTimestamp: prevAccepted?.timestamp,
         elapsedSeconds: elapsedSec,
         distanceFromPreviousAcceptedMeters: distFromPrev,
         previousAccuracy: prevAccepted?.accuracy,
-        latitude: position.latitude,
-        longitude: position.longitude,
-        accuracy: position.accuracy,
-        speed: position.speed,
         reportedSpeedValid: hasValidReportedSpeed,
         calculatedSpeed: calcSpeedFromPrev,
         accepted: false,
@@ -810,18 +972,23 @@ class FuelTrackerService extends ChangeNotifier with WidgetsBindingObserver {
       return;
     }
 
+    _hasReceivedPositionInRide = true;
+    _noFixWatchdogTimer?.cancel();
+    _noFixWatchdogTimer = null;
+    _noFixWatchdogAttempt = 0;
+    if (_hasNoLocationUpdates) {
+      _hasNoLocationUpdates = false;
+      notifyListeners();
+    }
+
     // 1. Ignore fixes with accuracy > maxAccuracyMeters (30 m)
     if (!MotionMath.isGoodFix(position, maxAccuracy: maxAccuracyMeters)) {
-      TrackingDiagnostics.instance.recordFix(
-        timestamp: position.timestamp,
+      _logDiagnosticFix(
+        position: position,
         previousAcceptedTimestamp: prevAccepted?.timestamp,
         elapsedSeconds: elapsedSec,
         distanceFromPreviousAcceptedMeters: distFromPrev,
         previousAccuracy: prevAccepted?.accuracy,
-        latitude: position.latitude,
-        longitude: position.longitude,
-        accuracy: position.accuracy,
-        speed: position.speed,
         reportedSpeedValid: hasValidReportedSpeed,
         calculatedSpeed: calcSpeedFromPrev,
         accepted: false,
@@ -834,21 +1001,16 @@ class FuelTrackerService extends ChangeNotifier with WidgetsBindingObserver {
     // Baseline fix establishing initial coordinate
     if (prevAccepted == null) {
       _lastAcceptedPosition = position;
-      TrackingDiagnostics.instance.recordFix(
-        timestamp: position.timestamp,
+      _logDiagnosticFix(
+        position: position,
         previousAcceptedTimestamp: null,
         elapsedSeconds: 0.0,
         distanceFromPreviousAcceptedMeters: 0.0,
         previousAccuracy: null,
-        latitude: position.latitude,
-        longitude: position.longitude,
-        accuracy: position.accuracy,
-        speed: position.speed,
         reportedSpeedValid: hasValidReportedSpeed,
         calculatedSpeed: 0.0,
         accepted: true,
         reason: 'Baseline fix (starting point, 0 m accumulated)',
-        segmentMeters: 0.0,
       );
       return;
     }
@@ -859,16 +1021,12 @@ class FuelTrackerService extends ChangeNotifier with WidgetsBindingObserver {
 
     // 2. Reject if dist < minDistanceMeters (5 m)
     if (distMeters < minDistanceMeters) {
-      TrackingDiagnostics.instance.recordFix(
-        timestamp: position.timestamp,
+      _logDiagnosticFix(
+        position: position,
         previousAcceptedTimestamp: prevAccepted.timestamp,
         elapsedSeconds: timeElapsedSeconds,
         distanceFromPreviousAcceptedMeters: distMeters,
         previousAccuracy: prevAccepted.accuracy,
-        latitude: position.latitude,
-        longitude: position.longitude,
-        accuracy: position.accuracy,
-        speed: position.speed,
         reportedSpeedValid: hasValidReportedSpeed,
         calculatedSpeed: calcSpeed,
         accepted: false,
@@ -890,16 +1048,12 @@ class FuelTrackerService extends ChangeNotifier with WidgetsBindingObserver {
           calcSpeed >= minSpeedMps && distMeters >= requiredDist;
 
       if (!isMovingByCalc) {
-        TrackingDiagnostics.instance.recordFix(
-          timestamp: position.timestamp,
+        _logDiagnosticFix(
+          position: position,
           previousAcceptedTimestamp: prevAccepted.timestamp,
           elapsedSeconds: timeElapsedSeconds,
           distanceFromPreviousAcceptedMeters: distMeters,
           previousAccuracy: prevAccepted.accuracy,
-          latitude: position.latitude,
-          longitude: position.longitude,
-          accuracy: position.accuracy,
-          speed: position.speed,
           reportedSpeedValid: hasValidReportedSpeed,
           calculatedSpeed: calcSpeed,
           accepted: false,
@@ -912,16 +1066,12 @@ class FuelTrackerService extends ChangeNotifier with WidgetsBindingObserver {
 
     // 4. Ignore implausible jumps (speed > maxSpeedMps = ~200 km/h)
     if (position.speed != null && position.speed! > maxSpeedMps) {
-      TrackingDiagnostics.instance.recordFix(
-        timestamp: position.timestamp,
+      _logDiagnosticFix(
+        position: position,
         previousAcceptedTimestamp: prevAccepted.timestamp,
         elapsedSeconds: timeElapsedSeconds,
         distanceFromPreviousAcceptedMeters: distMeters,
         previousAccuracy: prevAccepted.accuracy,
-        latitude: position.latitude,
-        longitude: position.longitude,
-        accuracy: position.accuracy,
-        speed: position.speed,
         reportedSpeedValid: hasValidReportedSpeed,
         calculatedSpeed: calcSpeed,
         accepted: false,
@@ -931,16 +1081,12 @@ class FuelTrackerService extends ChangeNotifier with WidgetsBindingObserver {
       return;
     }
     if (timeElapsedSeconds > 0 && calcSpeed > maxSpeedMps) {
-      TrackingDiagnostics.instance.recordFix(
-        timestamp: position.timestamp,
+      _logDiagnosticFix(
+        position: position,
         previousAcceptedTimestamp: prevAccepted.timestamp,
         elapsedSeconds: timeElapsedSeconds,
         distanceFromPreviousAcceptedMeters: distMeters,
         previousAccuracy: prevAccepted.accuracy,
-        latitude: position.latitude,
-        longitude: position.longitude,
-        accuracy: position.accuracy,
-        speed: position.speed,
         reportedSpeedValid: hasValidReportedSpeed,
         calculatedSpeed: calcSpeed,
         accepted: false,
@@ -955,16 +1101,12 @@ class FuelTrackerService extends ChangeNotifier with WidgetsBindingObserver {
     final segmentKm = distMeters / 1000.0;
     _rideDistanceKm += segmentKm;
 
-    TrackingDiagnostics.instance.recordFix(
-      timestamp: position.timestamp,
+    _logDiagnosticFix(
+      position: position,
       previousAcceptedTimestamp: prevAccepted.timestamp,
       elapsedSeconds: timeElapsedSeconds,
       distanceFromPreviousAcceptedMeters: distMeters,
       previousAccuracy: prevAccepted.accuracy,
-      latitude: position.latitude,
-      longitude: position.longitude,
-      accuracy: position.accuracy,
-      speed: position.speed,
       reportedSpeedValid: hasValidReportedSpeed,
       calculatedSpeed: calcSpeed,
       accepted: true,

@@ -304,7 +304,9 @@ class _ActiveBikeCardWidgetState extends State<ActiveBikeCardWidget>
                             ),
                             Text(
                               fuelTracker.isRiding
-                                  ? '${fuelTracker.rideDistanceKm.toStringAsFixed(1)} km tracked'
+                                  ? (fuelTracker.hasNoLocationUpdates
+                                      ? 'No location updates'
+                                      : '${fuelTracker.rideDistanceKm.toStringAsFixed(1)} km tracked')
                                   : 'Distance & fuel estimate',
                               style: GoogleFonts.manrope(
                                 fontSize: 11,

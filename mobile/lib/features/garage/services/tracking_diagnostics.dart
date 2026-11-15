@@ -1,7 +1,9 @@
+import 'dart:collection';
 import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
 
+import '../../navigation/domain/location_service.dart';
 import '../../navigation/domain/motion_math.dart';
 import '../../settings/controllers/settings_controller.dart';
 
@@ -33,6 +35,9 @@ enum TrackingEventType {
 
   /// Navigation reroute attempt outcome (accepted or discarded, with reason).
   reroute,
+
+  /// Location stream lifecycle event (created, restarted, or stopped).
+  stream,
 }
 
 /// Aggregated summary metrics computed across the recorded fix events in [TrackingDiagnostics].
@@ -47,6 +52,8 @@ class TrackingDiagnosticsSummary {
     required this.percentValidReportedSpeed,
     required this.longestGapWithoutAcceptedSeconds,
     required this.maxCalculatedSpeedAcceptedMps,
+    this.medianInterFixGapSeconds,
+    this.maxInterFixGapSeconds,
   });
 
   /// Total number of raw location fixes evaluated.
@@ -72,6 +79,12 @@ class TrackingDiagnosticsSummary {
 
   /// Maximum calculated speed in meters per second among accepted fixes.
   final double maxCalculatedSpeedAcceptedMps;
+
+  /// Median elapsed time in seconds between consecutive raw fixes, or `null` when fewer than 2 fixes exist.
+  final double? medianInterFixGapSeconds;
+
+  /// Maximum elapsed time in seconds between consecutive raw fixes, or `null` when fewer than 2 fixes exist.
+  final double? maxInterFixGapSeconds;
 
   /// Maximum calculated speed in km/h among accepted fixes.
   double get maxCalculatedSpeedAcceptedKmh =>
@@ -103,6 +116,10 @@ class TrackingEvent {
     this.message,
     this.heading,
     this.headingSource,
+    this.streamSource,
+    this.streamAction,
+    this.streamOwner,
+    this.streamMode,
   });
 
   /// Factory creating an accepted or rejected fix event.
@@ -122,6 +139,7 @@ class TrackingEvent {
     double? calculatedSpeed,
     double segmentMeters = 0.0,
     double accumulatedMeters = 0.0,
+    String? streamSource,
   }) {
     return TrackingEvent(
       timestamp: timestamp.toUtc(),
@@ -141,6 +159,25 @@ class TrackingEvent {
       reason: reason,
       segmentMeters: segmentMeters,
       accumulatedMeters: accumulatedMeters,
+      streamSource: streamSource,
+    );
+  }
+
+  /// Factory creating a stream lifecycle event (`created`, `restarted`, or `stopped`).
+  factory TrackingEvent.stream({
+    required DateTime timestamp,
+    required String action,
+    required String owner,
+    required String mode,
+    required String settingsSummary,
+  }) {
+    return TrackingEvent(
+      timestamp: timestamp.toUtc(),
+      type: TrackingEventType.stream,
+      streamAction: action,
+      streamOwner: owner,
+      streamMode: mode,
+      message: '$action | owner=$owner | mode=$mode | $settingsSummary',
     );
   }
 
@@ -300,6 +337,18 @@ class TrackingEvent {
   /// Origin of the heading used for reroutes (`"from last good fixes"` or `"none"`).
   final String? headingSource;
 
+  /// Stream owner and active mode tag that delivered a fix event (e.g. `"tracker:tracking"`).
+  final String? streamSource;
+
+  /// Stream lifecycle action (`"created"`, `"restarted"`, or `"stopped"`).
+  final String? streamAction;
+
+  /// Owner of the stream (`"tracker"`, `"navigation"`, `"place"`, or `"native"`).
+  final String? streamOwner;
+
+  /// Effective or requested stream mode (`"tracking"` or `"light"`).
+  final String? streamMode;
+
   bool get isGap => type == TrackingEventType.gap;
   bool get isRejected => status == TrackingFixStatus.rejected;
   bool get isAccepted => status == TrackingFixStatus.accepted;
@@ -370,8 +419,8 @@ class TrackingEvent {
 /// Central in-memory diagnostics singleton for real-time ride tracking observation.
 ///
 /// Records location fixes, filter decisions, time gaps, state transitions, and
-/// lifecycle states. Capped at the last 500 events to ensure strict memory safety.
-/// Automatically resets on application restart.
+/// lifecycle states. Capped at the last 5000 events to ensure strict memory safety
+/// at a 1-second GPS fix rate. Automatically resets on application restart.
 class TrackingDiagnostics extends ChangeNotifier {
   TrackingDiagnostics();
 
@@ -379,13 +428,13 @@ class TrackingDiagnostics extends ChangeNotifier {
   static final TrackingDiagnostics instance = TrackingDiagnostics();
 
   /// Maximum number of events retained in memory before dropping oldest.
-  static const int maxEvents = 500;
+  static const int maxEvents = 5000;
 
   /// In-memory event log ordered newest first.
   final List<TrackingEvent> _events = [];
 
-  /// Read-only snapshot of recorded events (newest first).
-  List<TrackingEvent> get events => List.unmodifiable(_events);
+  /// Read-only view of recorded events (newest first).
+  List<TrackingEvent> get events => UnmodifiableListView<TrackingEvent>(_events);
 
   double _accumulatedDistanceMeters = 0.0;
   int _acceptedCount = 0;
@@ -430,6 +479,7 @@ class TrackingDiagnostics extends ChangeNotifier {
     bool? reportedSpeedValid,
     double? calculatedSpeed,
     double segmentMeters = 0.0,
+    String? streamSource,
   }) {
     final utcTime = timestamp.toUtc();
 
@@ -471,8 +521,28 @@ class TrackingDiagnostics extends ChangeNotifier {
       reason: reason,
       segmentMeters: segmentMeters,
       accumulatedMeters: _accumulatedDistanceMeters,
+      streamSource: streamSource,
     ));
 
+    notifyListeners();
+  }
+
+  /// Records a `[STREAM]` lifecycle event whenever a location stream is created,
+  /// restarted, or stopped with its owner, mode, and real plugin settings.
+  void recordStreamEvent({
+    required String action,
+    required String owner,
+    required String mode,
+    required String settingsSummary,
+    DateTime? timestamp,
+  }) {
+    _insertEvent(TrackingEvent.stream(
+      timestamp: timestamp ?? DateTime.now().toUtc(),
+      action: action,
+      owner: owner,
+      mode: mode,
+      settingsSummary: settingsSummary,
+    ));
     notifyListeners();
   }
 
@@ -561,7 +631,7 @@ class TrackingDiagnostics extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Internal helper inserting an event at index 0 and enforcing the 500-event cap.
+  /// Internal helper inserting an event at index 0 and enforcing the [maxEvents] cap.
   void _insertEvent(TrackingEvent event) {
     _events.insert(0, event);
     while (_events.length > maxEvents) {
@@ -590,15 +660,29 @@ class TrackingDiagnostics extends ChangeNotifier {
         percentValidReportedSpeed: 0.0,
         longestGapWithoutAcceptedSeconds: 0.0,
         maxCalculatedSpeedAcceptedMps: 0.0,
+        medianInterFixGapSeconds: null,
+        maxInterFixGapSeconds: null,
       );
     }
 
     int accuracyRejected = 0;
     int validSpeedCount = 0;
     final List<double> accuracies = [];
+    final List<double> interFixGaps = [];
     double maxCalcSpeedAccepted = 0.0;
 
-    for (final fix in fixEvents) {
+    for (int i = 0; i < fixEvents.length; i++) {
+      final fix = fixEvents[i];
+      if (i > 0) {
+        final gapSec = math.max(
+          0.0,
+          MotionMath.elapsedSecondsBetween(
+            fixEvents[i - 1].timestamp,
+            fix.timestamp,
+          ),
+        );
+        interFixGaps.add(gapSec);
+      }
       if (fix.accuracy != null) {
         accuracies.add(fix.accuracy!);
       }
@@ -617,16 +701,10 @@ class TrackingDiagnostics extends ChangeNotifier {
       }
     }
 
-    double? medianAccuracy;
-    if (accuracies.isNotEmpty) {
-      accuracies.sort();
-      final mid = accuracies.length ~/ 2;
-      if (accuracies.length.isOdd) {
-        medianAccuracy = accuracies[mid];
-      } else {
-        medianAccuracy = (accuracies[mid - 1] + accuracies[mid]) / 2.0;
-      }
-    }
+    final medianAccuracy = _computeMedian(accuracies);
+    final medianInterFixGap = _computeMedian(interFixGaps);
+    final double? maxInterFixGap =
+        interFixGaps.isNotEmpty ? interFixGaps.reduce(math.max) : null;
 
     double longestGapWithoutAccepted = 0.0;
     final acceptedFixes = fixEvents.where((e) => e.isAccepted).toList();
@@ -681,7 +759,20 @@ class TrackingDiagnostics extends ChangeNotifier {
       percentValidReportedSpeed: (validSpeedCount / totalFixes) * 100.0,
       longestGapWithoutAcceptedSeconds: longestGapWithoutAccepted,
       maxCalculatedSpeedAcceptedMps: maxCalcSpeedAccepted,
+      medianInterFixGapSeconds: medianInterFixGap,
+      maxInterFixGapSeconds: maxInterFixGap,
     );
+  }
+
+  /// Computes the median of [values] (returns `null` when empty).
+  static double? _computeMedian(List<double> values) {
+    if (values.isEmpty) return null;
+    final sorted = List<double>.of(values)..sort();
+    final mid = sorted.length ~/ 2;
+    if (sorted.length.isOdd) {
+      return sorted[mid];
+    }
+    return (sorted[mid - 1] + sorted[mid]) / 2.0;
   }
 
   /// Generates a complete plain-text export of the current diagnostic state and log.
@@ -707,12 +798,20 @@ class TrackingDiagnostics extends ChangeNotifier {
     final medianAccStr = summary.medianAccuracyMeters != null
         ? '${summary.medianAccuracyMeters!.toStringAsFixed(1)} m'
         : 'N/A';
+    final medianGapStr = summary.medianInterFixGapSeconds != null
+        ? '${summary.medianInterFixGapSeconds!.toStringAsFixed(2)} s'
+        : 'N/A';
+    final maxGapStr = summary.maxInterFixGapSeconds != null
+        ? '${summary.maxInterFixGapSeconds!.toStringAsFixed(1)} s'
+        : 'N/A';
 
     final orderLabel = oldestFirst ? 'oldest first' : 'newest first';
     final buffer = StringBuffer()
       ..writeln('=== CAMP TRACKING DIAGNOSTICS LOG ===')
       ..writeln('Generated: ${MotionMath.formatUtcIso8601(DateTime.now())}')
       ..writeln('Location Provider Mode: $providerModeLabel')
+      ..writeln(
+          'Location Settings: tracker=tracking (${GeolocatorLocationService.trackingAccuracy.name}, ${GeolocatorLocationService.trackingInterval.inSeconds}s, ${GeolocatorLocationService.trackingDistanceFilterMeters}m), navigation=tracking (active) / light (idle), place=light (${GeolocatorLocationService.lightAccuracy.name}, default interval, ${GeolocatorLocationService.lightDistanceFilterMeters}m)')
       ..writeln('Tracker State: $_trackerState')
       ..writeln(
           'Accumulated Distance: ${_accumulatedDistanceMeters.toStringAsFixed(1)} m (${(_accumulatedDistanceMeters / 1000.0).toStringAsFixed(2)} km)')
@@ -728,6 +827,8 @@ class TrackingDiagnostics extends ChangeNotifier {
       ..writeln('- Median Accuracy: $medianAccStr')
       ..writeln(
           '- Valid Reported Speed: ${summary.percentValidReportedSpeed.toStringAsFixed(1)}% (${summary.validReportedSpeedFixes} / ${summary.totalFixes})')
+      ..writeln('- Inter-Fix Gap (Median): $medianGapStr')
+      ..writeln('- Inter-Fix Gap (Max): $maxGapStr')
       ..writeln(
           '- Longest Gap Without Accepted Fix: ${summary.longestGapWithoutAcceptedSeconds.toStringAsFixed(1)} s')
       ..writeln(
@@ -753,9 +854,13 @@ class TrackingDiagnostics extends ChangeNotifier {
         switch (event.type) {
           case TrackingEventType.fix:
             final statusStr = event.isAccepted ? 'ACCEPTED' : 'REJECTED';
+            final sourceStr = event.streamSource != null &&
+                    event.streamSource!.isNotEmpty
+                ? ' [${event.streamSource}]'
+                : '';
             final passedStr = event.segmentPassed ? 'yes' : 'no';
             buffer.writeln(
-              '[$timeStr] [$statusStr] '
+              '[$timeStr] [$statusStr]$sourceStr '
               'PrevTime: ${event.formattedPreviousAcceptedTimestampUtc} | '
               'dt: ${event.formattedElapsedSeconds} | '
               'DistFromPrev: ${event.formattedDistanceFromPreviousAccepted} | '
@@ -785,6 +890,9 @@ class TrackingDiagnostics extends ChangeNotifier {
             break;
           case TrackingEventType.reroute:
             buffer.writeln('[$timeStr] [REROUTE] ${event.message}');
+            break;
+          case TrackingEventType.stream:
+            buffer.writeln('[$timeStr] [STREAM] ${event.message}');
             break;
         }
       }

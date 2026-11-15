@@ -5,11 +5,12 @@ import 'package:flutter_map/flutter_map.dart';
 
 import '../../../../app/theme/app_colors.dart';
 import '../../controllers/navigation_controller.dart';
-import '../../domain/places_poi_service.dart';
+import '../../domain/routing_service.dart';
 
 /// Fullscreen interactive map view rendering OpenStreetMap raster tiles,
-/// polylines, user GPS indicator (blue dot, accuracy circle, heading cone),
-/// and POI markers.
+/// polylines (active orange route + greyed passed segment), next-maneuver turn
+/// marker, user GPS indicator (blue dot, accuracy circle, heading cone, rider
+/// arrow), and waypoint markers.
 class NavMapView extends StatelessWidget {
   const NavMapView({
     required this.controller,
@@ -34,9 +35,24 @@ class NavMapView extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final userLoc = controller.userLatLng;
-    final heading = controller.currentHeading ?? 0.0;
     final isNavigating = controller.state == NavigationState.navigating;
+    final isRidingState = isNavigating && controller.hasStartedMoving;
     final route = controller.route;
+    final nextManeuver = controller.nextManeuverStep;
+
+    // Determine screen-space rotation angle (in degrees) for the user marker.
+    // Because Marker(rotate: true) counter-rotates the marker against the map's
+    // rotation, 0.0 degrees in marker space always points straight UP on screen.
+    // - In RIDING heading-up follow mode (!isNorthUpMode): the map itself rotates
+    //   so the road ahead points UP; the rider arrow and cone stay fixed at 0.0°
+    //   (pointing straight UP on screen).
+    // - In RIDING North-up mode (isNorthUpMode) or READY / idle states: the map
+    //   is North-up (0.0°), so the marker rotates by the compass heading.
+    final double markerScreenHeadingDeg = (isRidingState && !controller.isNorthUpMode)
+        ? 0.0
+        : (isRidingState
+            ? controller.smoothedHeadingDegrees
+            : (controller.currentHeading ?? controller.smoothedHeadingDegrees));
 
     // Use cameraCenter which positions camera using GPS, destination, or Lahore fallback
     final initialCenter = controller.cameraCenter;
@@ -46,6 +62,7 @@ class NavMapView extends StatelessWidget {
       options: MapOptions(
         initialCenter: initialCenter,
         initialZoom: 15.0,
+        initialRotation: controller.mapRotationDegrees,
         minZoom: 3.0,
         maxZoom: 19.0,
         onTap: (_, _) => onTapMap?.call(),
@@ -54,6 +71,15 @@ class NavMapView extends StatelessWidget {
             controller.markUserPanned();
           }
           onPositionChanged?.call(pos, hasGesture);
+        },
+        onMapEvent: (event) {
+          // Manual two-finger rotation gestures emit MapEventRotate / MapEventRotateStart
+          // without necessarily triggering onPositionChanged when center is unchanged.
+          if ((event is MapEventRotate || event is MapEventRotateStart) &&
+              event.source != MapEventSource.mapController &&
+              event.source != MapEventSource.nonRotatedSizeChange) {
+            controller.markUserPanned();
+          }
         },
       ),
       children: [
@@ -66,7 +92,7 @@ class NavMapView extends StatelessWidget {
           errorTileCallback: (tile, error, stackTrace) {},
         ),
 
-        // 2. Polylines Layer (Route)
+        // 2. Polylines Layer (Route: alternate, greyed passed segment, active orange route)
         if (route != null) ...[
           // Alternate route polyline (subtle gray)
           if (route.alternatePolyline != null &&
@@ -83,47 +109,45 @@ class NavMapView extends StatelessWidget {
               ],
             ),
 
-          // Primary route polyline (tactical orange with smooth border)
-          PolylineLayer(
-            polylines: [
-              // Outer border / glow line
-              Polyline(
-                points: route.polyline,
-                strokeWidth: 9.0,
-                color: AppColors.tacticalOrangeDark.withValues(alpha: 0.5),
-                strokeCap: StrokeCap.round,
-                strokeJoin: StrokeJoin.round,
-              ),
-              // Inner main line
-              Polyline(
-                points: route.polyline,
-                strokeWidth: 6.0,
-                color: AppColors.tacticalOrange,
-                strokeCap: StrokeCap.round,
-                strokeJoin: StrokeJoin.round,
-              ),
-            ],
-          ),
+          // Greyed-out passed route segment behind the rider
+          if (controller.passedRoutePolyline.length >= 2)
+            PolylineLayer(
+              polylines: [
+                Polyline(
+                  points: controller.passedRoutePolyline,
+                  strokeWidth: 6.0,
+                  color: const Color(0xFF94A3B8).withValues(alpha: 0.75),
+                  strokeCap: StrokeCap.round,
+                  strokeJoin: StrokeJoin.round,
+                ),
+              ],
+            ),
+
+          // Primary active route polyline ahead of the rider (tactical orange with smooth border)
+          if (controller.activeRoutePolyline.isNotEmpty)
+            PolylineLayer(
+              polylines: [
+                // Outer border / glow line
+                Polyline(
+                  points: controller.activeRoutePolyline,
+                  strokeWidth: 9.0,
+                  color: AppColors.tacticalOrangeDark.withValues(alpha: 0.5),
+                  strokeCap: StrokeCap.round,
+                  strokeJoin: StrokeJoin.round,
+                ),
+                // Inner main line
+                Polyline(
+                  points: controller.activeRoutePolyline,
+                  strokeWidth: 6.0,
+                  color: AppColors.tacticalOrange,
+                  strokeCap: StrokeCap.round,
+                  strokeJoin: StrokeJoin.round,
+                ),
+              ],
+            ),
         ],
 
-        // 3. POI Markers Layer
-        if (controller.poiMarkers.isNotEmpty)
-          MarkerLayer(
-            markers: controller.poiMarkers.map((poi) {
-              final isSelected = controller.selectedPoiMarker?.id == poi.id;
-              return Marker(
-                point: poi.location,
-                width: 44,
-                height: 44,
-                child: GestureDetector(
-                  onTap: () => controller.selectPoiMarker(poi),
-                  child: _buildPoiMarker(poi, isSelected),
-                ),
-              );
-            }).toList(),
-          ),
-
-        // 4. Waypoint Markers (Stops & Destination)
+        // 3. Waypoint Markers (Stops & Destination)
         if (controller.destination != null)
           MarkerLayer(
             markers: [
@@ -133,6 +157,7 @@ class NavMapView extends StatelessWidget {
                   point: entry.value.location,
                   width: 32,
                   height: 32,
+                  rotate: true,
                   child: Container(
                     decoration: BoxDecoration(
                       color: AppColors.tacticalOrange,
@@ -163,6 +188,7 @@ class NavMapView extends StatelessWidget {
                 point: controller.destination!.location,
                 width: 44,
                 height: 44,
+                rotate: true,
                 alignment: Alignment.topCenter,
                 child: Container(
                   decoration: BoxDecoration(
@@ -189,6 +215,20 @@ class NavMapView extends StatelessWidget {
             ],
           ),
 
+        // 4. Next-Turn Maneuver Marker on Route (Active Navigation)
+        if (isNavigating && nextManeuver != null)
+          MarkerLayer(
+            markers: [
+              Marker(
+                point: nextManeuver.location,
+                width: 160,
+                height: 64,
+                rotate: true,
+                child: _buildNextTurnMarker(nextManeuver),
+              ),
+            ],
+          ),
+
         // 5. User GPS Location Marker (Dot, Accuracy Circle & Heading Cone)
         // Rendered strictly when a real GPS fix exists; never drawn at the camera fallback center.
         if (userLoc != null)
@@ -198,8 +238,9 @@ class NavMapView extends StatelessWidget {
                 point: userLoc,
                 width: 120,
                 height: 120,
+                rotate: true,
                 child: _buildUserLocationMarker(
-                  heading: heading,
+                  screenHeadingDeg: markerScreenHeadingDeg,
                   isNavigating: isNavigating,
                 ),
               ),
@@ -209,16 +250,77 @@ class NavMapView extends StatelessWidget {
     );
   }
 
+  /// Builds a white turn-arrow badge at the next maneuver coordinate on the route.
+  /// Displays the road/junction name strictly from `step.streetName` when present
+  /// and never invents fallback labels.
+  Widget _buildNextTurnMarker(RouteStep step) {
+    final streetLabel = step.streetName.trim();
+    return Column(
+      key: const ValueKey('nav_next_turn_marker'),
+      mainAxisSize: MainAxisSize.min,
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        Container(
+          width: 30,
+          height: 30,
+          decoration: BoxDecoration(
+            color: const Color(0xFF141416),
+            shape: BoxShape.circle,
+            border: Border.all(color: Colors.white, width: 2),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.35),
+                blurRadius: 6,
+                offset: const Offset(0, 2),
+              ),
+            ],
+          ),
+          child: Center(
+            child: Icon(
+              step.icon,
+              color: Colors.white,
+              size: 17,
+            ),
+          ),
+        ),
+        if (streetLabel.isNotEmpty) ...[
+          const SizedBox(height: 3),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+            decoration: BoxDecoration(
+              color: const Color(0xFF141416).withValues(alpha: 0.9),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(
+                color: Colors.white.withValues(alpha: 0.25),
+              ),
+            ),
+            child: Text(
+              streetLabel,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 10,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+
   Widget _buildUserLocationMarker({
-    required double heading,
+    required double screenHeadingDeg,
     required bool isNavigating,
   }) {
+    final angleRad = (screenHeadingDeg * math.pi) / 180.0;
     return Stack(
       alignment: Alignment.center,
       children: [
         // Heading Cone (Projected directional beam)
         Transform.rotate(
-          angle: (heading * math.pi) / 180.0,
+          angle: angleRad,
           child: CustomPaint(
             size: const Size(120, 120),
             painter: _HeadingConePainter(),
@@ -253,9 +355,11 @@ class NavMapView extends StatelessWidget {
           ),
           child: isNavigating
               ? Transform.rotate(
-                  angle: (heading * math.pi) / 180.0,
+                  key: const ValueKey('nav_rider_arrow_rotation'),
+                  angle: angleRad,
                   child: const Icon(
                     Icons.navigation_rounded,
+                    key: ValueKey('nav_rider_arrow'),
                     size: 12,
                     color: Colors.white,
                   ),
@@ -263,54 +367,6 @@ class NavMapView extends StatelessWidget {
               : null,
         ),
       ],
-    );
-  }
-
-  Widget _buildPoiMarker(PoiMarker poi, bool isSelected) {
-    Color bg;
-    IconData icon;
-
-    switch (poi.type) {
-      case PoiType.mechanic:
-        bg = AppColors.tacticalOrange;
-        icon = Icons.handyman_rounded;
-        break;
-      case PoiType.fuel:
-        bg = const Color(0xFF2563EB);
-        icon = Icons.local_gas_station_rounded;
-        break;
-      case PoiType.restStop:
-        bg = const Color(0xFF059669);
-        icon = Icons.park_rounded;
-        break;
-    }
-
-    return AnimatedContainer(
-      duration: const Duration(milliseconds: 200),
-      width: isSelected ? 42 : 34,
-      height: isSelected ? 42 : 34,
-      decoration: BoxDecoration(
-        color: bg,
-        shape: BoxShape.circle,
-        border: Border.all(
-          color: Colors.white,
-          width: isSelected ? 3.0 : 2.0,
-        ),
-        boxShadow: [
-          BoxShadow(
-            color: bg.withValues(alpha: 0.4),
-            blurRadius: isSelected ? 12 : 6,
-            spreadRadius: isSelected ? 2 : 0,
-          ),
-        ],
-      ),
-      child: Center(
-        child: Icon(
-          icon,
-          size: isSelected ? 20 : 16,
-          color: Colors.white,
-        ),
-      ),
     );
   }
 }

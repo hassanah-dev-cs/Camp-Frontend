@@ -36,6 +36,7 @@ class _FakeLocationService implements LocationService {
     bool highAccuracy = false,
     bool enableForegroundNotification = false,
     bool? forceLocationManager,
+    LocationStreamOwner owner = LocationStreamOwner.place,
   }) async* {
     if (position != null) yield position!;
   }

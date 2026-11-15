@@ -76,12 +76,16 @@ class _UpdateFuelSheetState extends State<UpdateFuelSheet> {
     _tankCapacity = widget.bike.fuelTankCapacityLiters ?? 20.0;
     if (_tankCapacity <= 0) _tankCapacity = 20.0;
 
-    final initial = widget.bike.fuelRemainingLiters ??
+    // Reuse existing FuelEstimator value that the card uses so the sheet opens
+    // on the current estimated fuel level instead of the raw saved base level.
+    final currentEstimate = FuelEstimator.currentLiters(widget.bike) ??
+        widget.bike.fuelRemainingLiters ??
         (widget.bike.fuelLevelPercent != null
             ? (widget.bike.fuelLevelPercent! * _tankCapacity / 100.0)
             : _tankCapacity * 0.5);
 
-    _liters = initial.clamp(0.0, _tankCapacity);
+    final rounded = double.parse(currentEstimate.toStringAsFixed(1));
+    _liters = rounded.clamp(0.0, _tankCapacity);
     _showRefillSection = widget.initialExpense != null;
     _isFullTank = widget.initialExpense?.isFullTank ?? false;
 
@@ -468,8 +472,18 @@ class _UpdateFuelSheetState extends State<UpdateFuelSheet> {
     final pct = FuelEstimator.percent(_liters, _tankCapacity) ?? 0.0;
     final isEditing = widget.initialExpense != null;
 
-    final litersNeeded = (_tankCapacity - (widget.bike.fuelRemainingLiters ?? 0.0))
+    final currentEstimate = FuelEstimator.currentLiters(widget.bike) ??
+        widget.bike.fuelRemainingLiters ??
+        0.0;
+    final litersNeeded = (_tankCapacity - currentEstimate)
         .clamp(0.0, _tankCapacity);
+
+    // Saved base level and odometer reading from when fuel was last recorded.
+    final savedLiters = widget.bike.fuelRemainingLiters;
+    final savedOdo = widget.bike.fuelLevelOdometerKm ??
+        widget.bike.preciseOdometerKm ??
+        widget.bike.odometerKm.toDouble();
+    final bool hasLastSet = savedLiters != null;
 
     return Padding(
       padding: EdgeInsets.only(
@@ -641,6 +655,26 @@ class _UpdateFuelSheetState extends State<UpdateFuelSheet> {
                       color: AppColors.tacticalOrange,
                     ),
                   ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'estimated from distance ridden',
+                    style: GoogleFonts.manrope(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w500,
+                      color: AppColors.mutedText,
+                    ),
+                  ),
+                  if (hasLastSet) ...[
+                    const SizedBox(height: 2),
+                    Text(
+                      'Last set: ${_formatSavedLiters(savedLiters)} L at ${_formatSavedOdo(savedOdo)} km',
+                      style: GoogleFonts.manrope(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w500,
+                        color: AppColors.mutedText,
+                      ),
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -912,6 +946,22 @@ class _UpdateFuelSheetState extends State<UpdateFuelSheet> {
     ),
   );
 }
+
+  /// Formats the last saved fuel level (e.g. 9.7 or 10).
+  static String _formatSavedLiters(double val) {
+    if (val.truncateToDouble() == val) {
+      return val.toInt().toString();
+    }
+    return val.toStringAsFixed(1);
+  }
+
+  /// Formats the odometer reading when fuel was last saved (e.g. 10000).
+  static String _formatSavedOdo(double val) {
+    if (val.truncateToDouble() == val) {
+      return val.toInt().toString();
+    }
+    return val.toStringAsFixed(1);
+  }
 
   Widget _quickLitersChip(String label, double val) {
     return GestureDetector(

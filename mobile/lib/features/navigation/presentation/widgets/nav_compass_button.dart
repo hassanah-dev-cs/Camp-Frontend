@@ -4,29 +4,48 @@ import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 
 import '../../../../app/theme/app_colors.dart';
+import '../../controllers/navigation_controller.dart';
 
 /// 52 px circular compass button shown during active RIDING state:
-/// - Visual needle displaying the active map orientation relative to North.
-/// - Sets map rotation back to North-up (0°) when tapped.
+/// - Visual needle displaying the real map rotation relative to North.
+/// - Switches between heading-up (follow) and North-up (`0°`) when tapped.
 /// - Accessible with semantic label "Compass" and >= 44 px touch target.
 class NavCompassButton extends StatelessWidget {
   const NavCompassButton({
     required this.mapController,
+    this.controller,
     super.key,
   });
 
   final MapController mapController;
+  final NavigationController? controller;
 
   double _getMapRotationDegrees() {
     try {
       return mapController.camera.rotation;
     } catch (_) {
-      return 0.0;
+      return controller?.mapRotationDegrees ?? 0.0;
     }
   }
 
-  void _resetNorth() {
-    mapController.rotate(0.0);
+  void _onTapCompass(BuildContext context) {
+    final nav = controller;
+    if (nav != null) {
+      final viewportHeight = MediaQuery.sizeOf(context).height;
+      nav.setViewportHeight(viewportHeight);
+      nav.toggleCompassMode();
+      try {
+        mapController.moveAndRotate(
+          nav.cameraCenterForViewportHeight(viewportHeight),
+          nav.targetZoom,
+          nav.mapRotationDegrees,
+        );
+      } catch (_) {
+        mapController.rotate(nav.mapRotationDegrees);
+      }
+    } else {
+      mapController.rotate(0.0);
+    }
   }
 
   @override
@@ -36,7 +55,7 @@ class NavCompassButton extends StatelessWidget {
       button: true,
       child: GestureDetector(
         key: const ValueKey('nav_compass_button'),
-        onTap: _resetNorth,
+        onTap: () => _onTapCompass(context),
         behavior: HitTestBehavior.opaque,
         child: Container(
           width: 52,
@@ -60,7 +79,7 @@ class NavCompassButton extends StatelessWidget {
             stream: mapController.mapEventStream,
             builder: (context, _) {
               final rotationDeg = _getMapRotationDegrees();
-              final rotationRad = -rotationDeg * (math.pi / 180.0);
+              final rotationRad = rotationDeg * (math.pi / 180.0);
 
               return Center(
                 child: Transform.rotate(

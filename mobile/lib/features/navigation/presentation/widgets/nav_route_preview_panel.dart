@@ -24,12 +24,17 @@ class NavRoutePreviewPanel extends StatelessWidget {
     final error = controller.routeError;
     final isCalc = controller.isCalculatingRoute;
 
-    // Show duration if route is ready; if location is unavailable or error,
-    // do NOT say "Calculating...", display "Location unavailable".
+    // Show duration if route is ready; show "Calculating..." while resolving
+    // an initial preview fix or routing, and "Location unavailable" only on real failures.
     final String durationText;
-    if (error != null || controller.latestGoodPosition == null) {
+    if (error != null ||
+        (controller.latestGoodPosition == null &&
+            !controller.isAcquiringPreviewLocation &&
+            !isCalc)) {
       durationText = 'Location unavailable';
-    } else if (isCalc || route == null) {
+    } else if (controller.isAcquiringPreviewLocation ||
+        isCalc ||
+        route == null) {
       durationText = 'Calculating...';
     } else {
       durationText = route.formattedDuration;

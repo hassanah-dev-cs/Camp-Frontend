@@ -54,7 +54,10 @@ class _GpsLivePillState extends State<GpsLivePill> {
   void _subscribeToStream() {
     try {
       _sub = widget.locationService
-          .getPositionStream(highAccuracy: false)
+          .getPositionStream(
+            highAccuracy: false,
+            owner: LocationStreamOwner.place,
+          )
           .listen((pos) {
         final isRecent = DateTime.now().difference(pos.timestamp).inSeconds < 120;
         if (mounted && isRecent != _isLive) {

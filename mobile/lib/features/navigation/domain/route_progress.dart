@@ -450,6 +450,65 @@ class RouteProgress {
     return diff > 180.0 ? 360.0 - diff : diff;
   }
 
+  /// Signed shortest angular difference in degrees (`(-180..180]`) from
+  /// [fromDegrees] to [toDegrees]. Positive values turn clockwise; negative
+  /// values turn counter-clockwise.
+  static double shortestAngleDeltaDegrees(
+    double fromDegrees,
+    double toDegrees,
+  ) {
+    double delta = ((toDegrees - fromDegrees) % 360.0 + 540.0) % 360.0 - 180.0;
+    if (delta == -180.0) {
+      delta = 180.0;
+    }
+    return delta;
+  }
+
+  /// Advances [currentHeadingDegrees] toward [targetHeadingDegrees] along the
+  /// shortest angular path, ignoring changes smaller than [deadbandDegrees]
+  /// (`5°`) and clamping the turn rate to [maxTurnRateDegPerSec] (`90°/s`)
+  /// over [dtSeconds].
+  static double stepSmoothedHeadingDegrees({
+    required double currentHeadingDegrees,
+    required double targetHeadingDegrees,
+    required double dtSeconds,
+    double maxTurnRateDegPerSec = 90.0,
+    double deadbandDegrees = 5.0,
+  }) {
+    final delta =
+        shortestAngleDeltaDegrees(currentHeadingDegrees, targetHeadingDegrees);
+    if (delta.abs() < deadbandDegrees) {
+      return (currentHeadingDegrees % 360.0 + 360.0) % 360.0;
+    }
+    if (dtSeconds <= 0.0) {
+      return (currentHeadingDegrees % 360.0 + 360.0) % 360.0;
+    }
+    final maxStep = maxTurnRateDegPerSec * dtSeconds;
+    final clampedDelta = delta.clamp(-maxStep, maxStep);
+    return ((currentHeadingDegrees + clampedDelta) % 360.0 + 360.0) % 360.0;
+  }
+
+  /// Projects [origin] forward by [distanceMeters] along compass [bearingDegrees]
+  /// (`0..360`, clockwise from North).
+  static LatLng offsetCoordinateAlongBearing({
+    required LatLng origin,
+    required double bearingDegrees,
+    required double distanceMeters,
+  }) {
+    if (distanceMeters == 0.0) return origin;
+    final bearingRad = bearingDegrees * (math.pi / 180.0);
+    final latRad = origin.latitudeInRad;
+    final cosLat = math.cos(latRad).abs().clamp(1e-6, 1.0);
+    final dNorthMeters = distanceMeters * math.cos(bearingRad);
+    final dEastMeters = distanceMeters * math.sin(bearingRad);
+    final dLat = dNorthMeters / 111319.490793;
+    final dLon = dEastMeters / (111319.490793 * cosLat);
+    return LatLng(
+      (origin.latitude + dLat).clamp(-85.0, 85.0),
+      origin.longitude + dLon,
+    );
+  }
+
   static double _segmentBearingAt(List<LatLng> polyline, int segmentIndex) {
     if (polyline.length < 2) return 0.0;
     final idx = segmentIndex.clamp(0, polyline.length - 2);

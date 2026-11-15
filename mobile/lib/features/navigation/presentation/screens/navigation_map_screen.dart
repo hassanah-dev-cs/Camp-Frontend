@@ -14,12 +14,10 @@ import '../widgets/nav_active_bottom_bar.dart';
 import '../widgets/nav_active_navigation_overlay.dart';
 import '../widgets/nav_arrived_sheet.dart';
 import '../widgets/nav_compass_button.dart';
-import '../widgets/nav_filter_chips.dart';
 import '../widgets/nav_location_sheet.dart';
 import '../widgets/nav_map_controls.dart';
 import '../widgets/nav_map_view.dart';
 import '../widgets/nav_permission_banner.dart';
-import '../widgets/nav_poi_detail_sheet.dart';
 import '../widgets/nav_riding_bottom_bar.dart';
 import '../widgets/nav_riding_turn_banner.dart';
 import '../widgets/nav_route_preview_panel.dart';
@@ -30,7 +28,7 @@ import '../widgets/nav_turn_banner.dart';
 
 /// Preset locations for quick navigation previews.
 /// Rebuilt Navigation Map Screen matching the 3-state design:
-/// State 1: Default map with search, filter chips, controls & "Your Location" sheet
+/// State 1: Default map with search bar, controls & "Your Location" sheet
 /// State 2: Route preview with waypoints, swap, fuel estimate & Start button
 /// State 3: Active navigation with turn banner, speedometer, Google Maps link, and bottom bar
 class NavigationMapScreen extends StatefulWidget {
@@ -179,6 +177,9 @@ class _NavigationMapScreenState extends State<NavigationMapScreen>
 
   @override
   Widget build(BuildContext context) {
+    final viewportHeight = MediaQuery.sizeOf(context).height;
+    _controller.setViewportHeight(viewportHeight);
+
     return ListenableBuilder(
       listenable: _controller,
       builder: (context, _) {
@@ -210,16 +211,22 @@ class _NavigationMapScreenState extends State<NavigationMapScreen>
           });
         }
 
-        // Auto-center camera during navigation when requested
+        // Auto-center and rotate camera during navigation when in follow mode
         if (isNavigating && _controller.isScreenCentered) {
           WidgetsBinding.instance.addPostFrameCallback((_) {
-            if (mounted) _mapController.move(_controller.cameraCenter, 17.0);
+            if (mounted) {
+              _mapController.moveAndRotate(
+                _controller.cameraCenterForViewportHeight(viewportHeight),
+                _controller.targetZoom,
+                _controller.mapRotationDegrees,
+              );
+            }
           });
         } else if (!_hasCenteredOnInitialPosition && _controller.currentPosition != null) {
           _hasCenteredOnInitialPosition = true;
           WidgetsBinding.instance.addPostFrameCallback((_) {
             if (mounted && _controller.state == NavigationState.idle) {
-              _mapController.move(_controller.cameraCenter, 15.0);
+              _mapController.moveAndRotate(_controller.cameraCenter, 15.0, 0.0);
             }
           });
         }
@@ -243,7 +250,6 @@ class _NavigationMapScreenState extends State<NavigationMapScreen>
                     mapController: _mapController,
                     tileProvider: widget.tileProvider,
                     onTapMap: () {
-                      _controller.clearSelectedPoiMarker();
                       if (_controller.state == NavigationState.arrived) {
                         _controller.dismissArrived();
                       }
@@ -283,10 +289,6 @@ class _NavigationMapScreenState extends State<NavigationMapScreen>
                                 _fitRouteBounds();
                               },
                             ),
-                            const SizedBox(height: 10),
-
-                            // State 1: Filter Chips
-                            NavFilterChips(controller: _controller),
 
                             // Location Permission Alert Banner
                             NavPermissionBanner(
@@ -318,7 +320,10 @@ class _NavigationMapScreenState extends State<NavigationMapScreen>
                 if (!isNavigating)
                   Positioned(
                     right: 16,
-                    top: isPreviewing ? 270 : 160,
+                    // In idle state, sits directly below search bar with a balanced 12 px gap
+                    top: isPreviewing
+                        ? 270
+                        : MediaQuery.of(context).padding.top + 72,
                     child: NavMapControls(
                       controller: _controller,
                       mapController: _mapController,
@@ -358,9 +363,14 @@ class _NavigationMapScreenState extends State<NavigationMapScreen>
                     right: 16,
                     bottom: isRidingState ? 104 : 170,
                     child: GestureDetector(
+                      key: const ValueKey('nav_recenter_button'),
                       onTap: () {
                         _controller.recenterMap();
-                        _mapController.move(_controller.cameraCenter, 17.0);
+                        _mapController.moveAndRotate(
+                          _controller.cameraCenterForViewportHeight(viewportHeight),
+                          _controller.targetZoom,
+                          _controller.mapRotationDegrees,
+                        );
                       },
                       behavior: HitTestBehavior.opaque,
                       child: Container(
@@ -422,7 +432,10 @@ class _NavigationMapScreenState extends State<NavigationMapScreen>
                             if (isRiding && isGpsWeak) const SizedBox(height: 6),
                             if (isGpsWeak) _buildWeakGpsChip(),
                             const SizedBox(height: 10),
-                            NavCompassButton(mapController: _mapController),
+                            NavCompassButton(
+                              mapController: _mapController,
+                              controller: _controller,
+                            ),
                           ],
                         ),
                       );
@@ -436,8 +449,9 @@ class _NavigationMapScreenState extends State<NavigationMapScreen>
                       return const SizedBox.shrink();
                     }
                     return Positioned(
+                      // In idle state, aligns directly below search bar at top + 72 (freed chip space removed)
                       top: MediaQuery.of(context).padding.top +
-                          (isNavigating ? 112 : (isPreviewing ? 320 : 124)),
+                          (isNavigating ? 112 : (isPreviewing ? 320 : 72)),
                       left: 16,
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
@@ -472,17 +486,8 @@ class _NavigationMapScreenState extends State<NavigationMapScreen>
                     child: Column(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        // Selected POI Detail Sheet
-                        if (_controller.selectedPoiMarker != null && !isNavigating)
-                          NavPoiDetailSheet(
-                            marker: _controller.selectedPoiMarker!,
-                            controller: _controller,
-                            onClose: _controller.clearSelectedPoiMarker,
-                          ),
-
                         // State 1: Collapsed Your Location Card
-                        if (state == NavigationState.idle &&
-                            _controller.selectedPoiMarker == null)
+                        if (state == NavigationState.idle)
                           NavLocationSheet(
                             controller: _controller,
                             onTapDirections: _openDefaultDirections,
@@ -575,7 +580,9 @@ class _NavigationMapScreenState extends State<NavigationMapScreen>
           ),
           const SizedBox(width: 6),
           Text(
-            'Tracking ride • ${FuelTrackerService.instance.rideDistanceKm.toStringAsFixed(1)} km',
+            FuelTrackerService.instance.hasNoLocationUpdates
+                ? 'Tracking ride • No location updates'
+                : 'Tracking ride • ${FuelTrackerService.instance.rideDistanceKm.toStringAsFixed(1)} km',
             style: GoogleFonts.manrope(
               fontSize: 11.5,
               fontWeight: FontWeight.w700,

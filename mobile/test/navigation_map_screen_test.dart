@@ -95,6 +95,10 @@ void main() {
       expect(find.text('Directions'), findsOneWidget);
       expect(find.byType(CampBottomNav), findsOneWidget);
 
+      // Verify quick filter chips are removed
+      expect(find.text('Nearby Mechanics'), findsNothing);
+      expect(find.text('Rest Stops'), findsNothing);
+
       controller.dispose();
       fakeLocation.dispose();
       FuelTrackerService.instance.resetForTesting();
@@ -861,6 +865,172 @@ void main() {
         ),
       );
       await tester.pumpAndSettle();
+
+      controller.dispose();
+      fakeLocation.dispose();
+      FuelTrackerService.instance.resetForTesting();
+    });
+
+    testWidgets('BATCH S4-4b: READY stays north-up; RIDING rotates heading-up with fixed up-arrow, next-turn marker, compass toggle, and single Recenter button', (tester) async {
+      tester.view.physicalSize = const Size(1080, 2400);
+      tester.view.devicePixelRatio = 2.0;
+      addTearDown(tester.view.resetPhysicalSize);
+
+      final t0 = DateTime.utc(2026, 6, 10, 12, 0, 0);
+      final fakeLocation = FakeLocationService(
+        initialPosition: PositionData(
+          latitude: 31.5204,
+          longitude: 74.3587,
+          accuracy: 5.0,
+          speed: 0.0,
+          timestamp: t0,
+        ),
+      );
+      final fakeRouting = FakeRoutingService(
+        cannedResult: const RouteResult(
+          polyline: [
+            LatLng(31.5204, 74.3587),
+            LatLng(31.5204, 74.3596),
+            LatLng(31.5212, 74.3596),
+          ],
+          distanceMeters: 200.0,
+          durationSeconds: 30.0,
+          steps: [
+            RouteStep(
+              maneuverType: 'depart',
+              streetName: 'Start St',
+              distanceMeters: 85.0,
+              durationSeconds: 12.0,
+              location: LatLng(31.5204, 74.3587),
+              instruction: 'Head east on Start St',
+            ),
+            RouteStep(
+              maneuverType: 'turn',
+              maneuverModifier: 'left',
+              streetName: 'Main Blvd',
+              distanceMeters: 115.0,
+              durationSeconds: 18.0,
+              location: LatLng(31.5204, 74.3596),
+              instruction: 'Turn left onto Main Blvd',
+            ),
+            RouteStep(
+              maneuverType: 'arrive',
+              streetName: 'Destination',
+              distanceMeters: 0.0,
+              durationSeconds: 0.0,
+              location: LatLng(31.5212, 74.3596),
+              instruction: 'Arrive at destination',
+            ),
+          ],
+        ),
+      );
+      final fakeGeocoding = FakeGeocodingService();
+      FuelTrackerService.instance.setDependenciesForTesting(
+        locationService: fakeLocation,
+      );
+      final controller = NavigationController(
+        locationService: fakeLocation,
+        routingService: fakeRouting,
+        geocodingService: fakeGeocoding,
+      );
+      controller.toggleSavedPlace(
+        const PlaceSearchResult(
+          name: 'Test Destination',
+          displayName: 'Test Destination Point',
+          location: LatLng(31.5212, 74.3596),
+        ),
+      );
+
+      await tester.pumpWidget(
+        buildTestScreen(
+          controller: controller,
+          locationService: fakeLocation,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Open Route Preview -> stays North-up (0.0°)
+      await tester.tap(find.text('Directions'));
+      await tester.pumpAndSettle();
+      expect(controller.state, NavigationState.previewing);
+      expect(controller.mapRotationDegrees, 0.0);
+
+      // Start Navigation -> READY state stays North-up (0.0°)
+      await tester.tap(find.text('Start'));
+      await tester.pumpAndSettle();
+      expect(controller.state, NavigationState.navigating);
+      expect(controller.hasStartedMoving, isFalse);
+      expect(controller.mapRotationDegrees, 0.0);
+
+      // Emit two good fixes moving East (~38 m apart over 4 s) to enter RIDING state
+      fakeLocation.emitPosition(
+        PositionData(
+          latitude: 31.5204,
+          longitude: 74.3587,
+          accuracy: 5.0,
+          speed: 8.0,
+          timestamp: t0.add(const Duration(seconds: 1)),
+        ),
+      );
+      await tester.pump();
+      fakeLocation.emitPosition(
+        PositionData(
+          latitude: 31.5204,
+          longitude: 74.3591,
+          accuracy: 5.0,
+          speed: 8.0,
+          timestamp: t0.add(const Duration(seconds: 5)),
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+
+      expect(controller.hasStartedMoving, isTrue);
+      // Map rotated heading-up (~-90° for Eastbound heading)
+      expect(controller.mapRotationDegrees, closeTo(-90.0, 2.0));
+
+      // Rider arrow stays fixed pointing straight UP on screen (0.0 rad) in heading-up follow mode
+      final arrowRotate = tester.widget<Transform>(
+        find.byKey(const ValueKey('nav_rider_arrow_rotation')),
+      );
+      expect(arrowRotate.transform.getMaxScaleOnAxis(), closeTo(1.0, 1e-3));
+
+      // Next-turn marker is rendered on the route with step road name ('Main Blvd')
+      expect(find.byKey(const ValueKey('nav_next_turn_marker')), findsOneWidget);
+      expect(
+        find.descendant(
+          of: find.byKey(const ValueKey('nav_next_turn_marker')),
+          matching: find.text('Main Blvd'),
+        ),
+        findsOneWidget,
+      );
+
+      // Compass button toggles between heading-up and North-up (0°)
+      expect(find.byType(NavCompassButton), findsOneWidget);
+      await tester.tap(find.byType(NavCompassButton));
+      await tester.pump();
+      expect(controller.isNorthUpMode, isTrue);
+      expect(controller.mapRotationDegrees, 0.0);
+
+      // Tap compass button again -> returns to heading-up follow mode
+      await tester.tap(find.byType(NavCompassButton));
+      await tester.pump();
+      expect(controller.isNorthUpMode, isFalse);
+      expect(controller.mapRotationDegrees, closeTo(-90.0, 2.0));
+
+      // Manual panning pauses follow mode and shows exactly ONE Recenter button
+      controller.markUserPanned();
+      await tester.pump();
+      expect(controller.isScreenCentered, isFalse);
+      expect(find.byKey(const ValueKey('nav_recenter_button')), findsOneWidget);
+      expect(find.text('Recenter'), findsOneWidget);
+
+      // Tapping Recenter restores follow mode and hides the Recenter button
+      await tester.tap(find.byKey(const ValueKey('nav_recenter_button')));
+      await tester.pump();
+      expect(controller.isScreenCentered, isTrue);
+      expect(controller.isNorthUpMode, isFalse);
+      expect(find.byKey(const ValueKey('nav_recenter_button')), findsNothing);
 
       controller.dispose();
       fakeLocation.dispose();

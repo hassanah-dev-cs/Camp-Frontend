@@ -259,6 +259,7 @@ class CurrentPlaceController extends ChangeNotifier {
             highAccuracy: false,
             forceLocationManager:
                 SettingsController.instance.gpsOnlyLocationProvider,
+            owner: LocationStreamOwner.place,
           )
           .listen((pos) {
         updatePosition(pos, isFreshFix: true);

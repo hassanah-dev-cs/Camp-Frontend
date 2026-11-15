@@ -1,25 +1,38 @@
+import 'dart:io';
+
 import 'package:camp/app/routes.dart';
 import 'package:camp/app/theme/app_colors.dart';
+import 'package:camp/core/data/app_repositories.dart';
+import 'package:camp/features/dashboard/controllers/profile_controller.dart';
 import 'package:camp/features/dashboard/presentation/screens/profile_screen.dart';
 import 'package:camp/features/dashboard/presentation/widgets/app_drawer_widget.dart';
 import 'package:camp/features/garage/controllers/active_bike_controller.dart';
 import 'package:camp/features/garage/domain/bike_model.dart';
 import 'package:camp/features/garage/services/fuel_tracker_service.dart';
 import 'package:camp/features/garage/services/tracking_diagnostics.dart';
+import 'package:camp/features/maintenance/controllers/post_ride_report_controller.dart';
 import 'package:camp/features/navigation/domain/location_service.dart';
+import 'package:camp/features/settings/controllers/settings_controller.dart';
 import 'package:camp/features/settings/presentation/screens/settings_screen.dart';
 import 'package:camp/features/settings/presentation/screens/tracking_diagnostics_screen.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'helpers/fake_cache_service.dart';
 import 'helpers/fake_in_progress_ride_repository.dart';
 import 'helpers/fake_location_service.dart';
+import 'helpers/fake_ride_report_repository.dart';
+import 'helpers/fake_settings_repository.dart';
+import 'helpers/fake_share_platform.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
   late FakeLocationService fakeLocationService;
+  late FakeSettingsRepository fakeSettingsRepo;
+  late FakeCacheService fakeCacheService;
 
   const testBike = Bike(
     id: 'bike-diag-1',
@@ -33,8 +46,28 @@ void main() {
     odometerKm: 10000,
   );
 
+  final defaultPathProvider = PathProviderPlatform.instance;
+
   setUp(() {
     SharedPreferences.setMockInitialValues({});
+    PackageInfo.setMockInitialValues(
+      appName: 'CAMP',
+      packageName: 'com.camp.mobile',
+      version: '1.2.3',
+      buildNumber: '42',
+      buildSignature: '',
+    );
+    fakeSettingsRepo = FakeSettingsRepository();
+    fakeCacheService = FakeCacheService(sizeBytes: 1024 * 20);
+    AppRepositories.resetWith(settingsRepository: fakeSettingsRepo);
+    SettingsController.instance = SettingsController(
+      repository: fakeSettingsRepo,
+      cacheService: fakeCacheService,
+    );
+    ProfileController.instance.resetForTesting();
+    PostRideReportController.instance =
+        PostRideReportController(repository: FakeRideReportRepository());
+    PathProviderPlatform.instance = FakePathProviderPlatform(defaultPathProvider);
     fakeLocationService = FakeLocationService();
     ActiveBikeController.instance.resetForTesting();
     ActiveBikeController.instance.addBike(testBike, setActive: true);
@@ -49,17 +82,18 @@ void main() {
   });
 
   tearDown(() {
+    AppRepositories.resetToDefault();
     TrackingDiagnostics.instance.clear();
     FuelTrackerService.instance.resetForTesting();
   });
 
   group('TrackingDiagnostics Unit Tests', () {
-    test('enforces strict log cap at 500 events and drops oldest', () {
+    test('enforces strict log cap at 5000 events and drops oldest', () {
       final diag = TrackingDiagnostics.instance;
       final baseTime = DateTime(2026, 11, 1, 12, 0, 0);
 
-      // Record 550 events
-      for (int i = 0; i < 550; i++) {
+      // Record 5050 events
+      for (int i = 0; i < 5050; i++) {
         diag.recordFix(
           timestamp: baseTime.add(Duration(seconds: i)),
           latitude: 31.52040,
@@ -72,11 +106,11 @@ void main() {
         );
       }
 
-      // Assert cap at 500
-      expect(diag.events.length, equals(500));
+      // Assert cap at 5000
+      expect(diag.events.length, equals(5000));
 
       // The newest event should be index 0
-      expect(diag.events.first.reason, equals('Fix #549'));
+      expect(diag.events.first.reason, equals('Fix #5049'));
 
       // The oldest retained event should be Fix #50 (events 0..49 dropped)
       expect(diag.events.last.reason, equals('Fix #50'));
@@ -274,7 +308,13 @@ void main() {
 
       // Test default/newest-first (for Copy log)
       final newestFirstLog = diag.formatLogAsPlainText(oldestFirst: false);
-      expect(newestFirstLog, contains('=== EVENTS (120 of 500, newest first) ==='));
+      expect(
+        newestFirstLog,
+        contains(
+          'Location Settings: tracker=tracking (bestForNavigation, 1s, 0m), navigation=tracking (active) / light (idle), place=light (medium, default interval, 10m)',
+        ),
+      );
+      expect(newestFirstLog, contains('=== EVENTS (120 of 5000, newest first) ==='));
       final newestFirstIdxOldest = newestFirstLog.indexOf('Waypoint #0');
       final newestFirstIdxNewest = newestFirstLog.indexOf('Waypoint #119');
       expect(newestFirstIdxNewest, isNot(-1));
@@ -284,7 +324,7 @@ void main() {
 
       // Test oldest-first export (for file export)
       final oldestFirstLog = diag.formatLogAsPlainText(oldestFirst: true);
-      expect(oldestFirstLog, contains('=== EVENTS (120 of 500, oldest first) ==='));
+      expect(oldestFirstLog, contains('=== EVENTS (120 of 5000, oldest first) ==='));
 
       // Check all 120 events are present (not capped by any string/count limit)
       for (int i = 0; i < 120; i++) {
@@ -301,12 +341,17 @@ void main() {
   group('TrackingDiagnostics Widget & Visibility Tests', () {
     testWidgets('settings screen hides diagnostics row when isDebugMode is false',
         (tester) async {
+      tester.view.physicalSize = const Size(1080, 4000);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+
       await tester.pumpWidget(
         const MaterialApp(
           home: SettingsScreen(isDebugMode: false),
         ),
       );
-      await tester.pumpAndSettle();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
 
       expect(find.text('Tracking diagnostics (debug)'), findsNothing);
       expect(find.byKey(const ValueKey('settings_tracking_diagnostics_row')),
@@ -315,12 +360,17 @@ void main() {
 
     testWidgets('settings screen shows diagnostics row when isDebugMode is true',
         (tester) async {
+      tester.view.physicalSize = const Size(1080, 4000);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+
       await tester.pumpWidget(
         const MaterialApp(
           home: SettingsScreen(isDebugMode: true),
         ),
       );
-      await tester.pumpAndSettle();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
 
       expect(find.text('Tracking diagnostics (debug)'), findsOneWidget);
       expect(find.byKey(const ValueKey('settings_tracking_diagnostics_row')),
@@ -334,7 +384,8 @@ void main() {
           home: TrackingDiagnosticsScreen(isDebugMode: false),
         ),
       );
-      await tester.pumpAndSettle();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
 
       expect(find.text('TRACKING DIAGNOSTICS'), findsNothing);
       expect(find.text('Tracking diagnostics is only available in debug builds.'),
@@ -383,7 +434,8 @@ void main() {
           home: TrackingDiagnosticsScreen(isDebugMode: true),
         ),
       );
-      await tester.pumpAndSettle();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
 
       // Verify header and thresholds
       expect(find.text('TRACKING DIAGNOSTICS'), findsOneWidget);
@@ -419,7 +471,8 @@ void main() {
 
       // Tap clear button
       await tester.tap(find.byKey(const ValueKey('tracking_diag_clear_button')));
-      await tester.pumpAndSettle();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
 
       expect(diag.events, isEmpty);
       expect(find.text('No tracking events recorded yet.'), findsOneWidget);
@@ -450,10 +503,12 @@ void main() {
           },
         ),
       );
-      await tester.pumpAndSettle();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
 
       await tester.tap(find.text('Go to Settings'));
-      await tester.pumpAndSettle();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
 
       expect(find.text('Tracking diagnostics (debug)'), findsOneWidget);
       expect(find.byKey(const ValueKey('settings_tracking_diagnostics_row')),
@@ -461,7 +516,8 @@ void main() {
 
       // Verify tapping it opens Tracking Diagnostics screen via CampRoutes.trackingDiagnostics
       await tester.tap(find.byKey(const ValueKey('settings_tracking_diagnostics_row')));
-      await tester.pumpAndSettle();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
 
       expect(find.text('TRACKING DIAGNOSTICS'), findsOneWidget);
     });
@@ -486,16 +542,19 @@ void main() {
           },
         ),
       );
-      await tester.pumpAndSettle();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
 
       // Open drawer
       final scaffoldState = tester.state<ScaffoldState>(find.byType(Scaffold));
       scaffoldState.openDrawer();
-      await tester.pumpAndSettle();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
 
       // Tap Settings in drawer
       await tester.tap(find.text('Settings'));
-      await tester.pumpAndSettle();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 400));
 
       expect(find.text('Tracking diagnostics (debug)'), findsOneWidget);
       expect(find.byKey(const ValueKey('settings_tracking_diagnostics_row')),
@@ -519,7 +578,8 @@ void main() {
           },
         ),
       );
-      await tester.pumpAndSettle();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
 
       // In Profile tab's SETTINGS section:
       expect(find.text('Tracking diagnostics (debug)'), findsOneWidget);
@@ -528,7 +588,8 @@ void main() {
 
       // Tapping Help & Support from Profile tab opens SettingsScreen with diagnostics row
       await tester.tap(find.text('Help & Support'));
-      await tester.pumpAndSettle();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
 
       expect(find.byKey(const ValueKey('settings_tracking_diagnostics_row')),
           findsOneWidget);
@@ -544,18 +605,114 @@ void main() {
         tester.view.resetDevicePixelRatio();
       });
 
+      int shareCallCount = 0;
+      String? sharedPath;
+      Rect? sharedOrigin;
+
       await tester.pumpWidget(
-        const MaterialApp(
-          home: TrackingDiagnosticsScreen(isDebugMode: true),
+        MaterialApp(
+          home: TrackingDiagnosticsScreen(
+            isDebugMode: true,
+            onShareFile: (path, origin) async {
+              shareCallCount++;
+              sharedPath = path;
+              sharedOrigin = origin;
+            },
+          ),
         ),
       );
-      await tester.pumpAndSettle();
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
 
       expect(find.byKey(const ValueKey('tracking_diag_copy_button')), findsOneWidget);
       expect(find.byKey(const ValueKey('tracking_diag_share_file_button')), findsOneWidget);
       expect(find.byKey(const ValueKey('tracking_diag_clear_button')), findsOneWidget);
       expect(find.text('Share log as file'), findsOneWidget);
-      expect(tester.takeException(), isNull);
+
+      await tester.runAsync(() async {
+        await tester.tap(find.byKey(const ValueKey('tracking_diag_share_file_button')));
+        await Future<void>.delayed(const Duration(milliseconds: 150));
+      });
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+
+      expect(shareCallCount, 1);
+      expect(sharedPath, isNotNull);
+      expect(File(sharedPath!).existsSync(), isTrue);
+      expect(sharedOrigin, isNotNull);
+    });
+
+    testWidgets(
+        'Share log as file shares complete oldest-first log file with more than 500 events',
+        (tester) async {
+      tester.view.physicalSize = const Size(1080, 2400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+
+      int shareCallCount = 0;
+      String? sharedPath;
+
+      final diag = TrackingDiagnostics.instance;
+      diag.clear();
+      final t0 = DateTime.utc(2026, 11, 1, 8, 0, 0);
+
+      // Populate 600 events (> 500 events)
+      for (int i = 0; i < 600; i++) {
+        diag.recordFix(
+          timestamp: t0.add(Duration(seconds: i)),
+          latitude: 33.68440 + (i * 0.00001),
+          longitude: 73.04790,
+          accuracy: 6.0,
+          speed: 10.0,
+          accepted: true,
+          reason: 'Fix #$i',
+          segmentMeters: 1.0,
+        );
+      }
+      expect(diag.events.length, 600);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: TrackingDiagnosticsScreen(
+            isDebugMode: true,
+            onShareFile: (path, origin) async {
+              shareCallCount++;
+              sharedPath = path;
+            },
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+
+      expect(find.text('EVENT LOG (600 of 5000, newest first)'), findsOneWidget);
+
+      await tester.runAsync(() async {
+        await tester.tap(find.byKey(const ValueKey('tracking_diag_share_file_button')));
+        await Future<void>.delayed(const Duration(milliseconds: 150));
+      });
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+
+      expect(shareCallCount, 1);
+      expect(sharedPath, isNotNull);
+      final file = File(sharedPath!);
+      expect(file.existsSync(), isTrue);
+
+      final content = file.readAsStringSync();
+      expect(content, contains('=== EVENTS (600 of 5000, oldest first) ==='));
+      expect(content, contains('Reason: Fix #0'));
+      expect(content, contains('Reason: Fix #599'));
+      // Oldest (Fix #0) appears before newest (Fix #599)
+      expect(content.indexOf('Fix #0'), lessThan(content.indexOf('Fix #599')));
+
+      // Clean up temp file
+      try {
+        file.deleteSync();
+      } catch (_) {}
     });
   });
 }

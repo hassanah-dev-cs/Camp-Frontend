@@ -7,6 +7,7 @@ import 'package:camp/core/data/bike_repository.dart';
 import 'package:camp/core/data/in_progress_ride_model.dart';
 import 'package:camp/core/storage/local_store.dart';
 import 'package:camp/features/dashboard/presentation/screens/home_screen.dart';
+import 'package:camp/features/dashboard/presentation/widgets/active_bike_card_widget.dart';
 import 'package:camp/features/dashboard/presentation/widgets/ride_summary_sheet.dart';
 import 'package:camp/features/dashboard/presentation/widgets/unfinished_ride_recovery_sheet.dart';
 import 'package:camp/features/garage/controllers/active_bike_controller.dart';
@@ -18,6 +19,7 @@ import 'package:camp/features/garage/services/tracking_diagnostics.dart';
 import 'package:camp/features/maintenance/controllers/post_ride_report_controller.dart';
 import 'package:camp/features/maintenance/domain/post_ride_report.dart';
 import 'package:camp/features/maintenance/presentation/screens/post_ride_debrief_screen.dart';
+import 'package:camp/features/navigation/controllers/current_place_controller.dart';
 import 'package:camp/features/navigation/controllers/navigation_controller.dart';
 import 'package:camp/features/navigation/domain/geocoding_service.dart';
 import 'package:camp/features/navigation/domain/location_service.dart';
@@ -28,9 +30,11 @@ import 'package:camp/features/navigation/presentation/screens/navigation_map_scr
 import 'package:camp/features/navigation/presentation/widgets/nav_arrived_sheet.dart';
 import 'package:camp/features/settings/controllers/settings_controller.dart';
 import 'package:camp/features/settings/presentation/screens/tracking_diagnostics_screen.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -1842,7 +1846,8 @@ void main() {
       await pumpEventQueue();
       expect(nav.snappedPosition, isNull);
       expect(nav.userLatLng!.latitude, closeTo(33.68440 + 0.000315, 1e-6));
-      expect(nav.currentHeading, closeTo(82.0, 0.1));
+      // Un-snapped currentHeading uses reliableHeadingDegrees (from last two good fixes >= 20m apart), never pos.heading
+      expect(nav.currentHeading, equals(nav.reliableHeadingDegrees));
 
       await fuelTracker.stopRide();
       nav.dispose();
@@ -3477,7 +3482,7 @@ void main() {
         ],
       );
 
-      // Subcase A: Speed is 1.2 m/s (< 2.0 m/s), even though fixes are 28 m apart
+      // Subcase A: Inter-fix speed is ~1.39 m/s (< 2.0 m/s), even though fixes are 28 m apart (28 m over 20 s)
       for (int i = 0; i < 3; i++) {
         fakeLocation.emitPosition(PositionData(
           latitude: offRouteOrigin.latitude,
@@ -3485,7 +3490,7 @@ void main() {
           accuracy: 8.0,
           speed: 1.2, // < 2.0 m/s minimum speed
           heading: null,
-          timestamp: t0.add(Duration(seconds: 5 + (i * 5))),
+          timestamp: t0.add(Duration(seconds: 5 + (i * 20))),
         ));
         await pumpEventQueue();
       }
@@ -3663,5 +3668,1084 @@ void main() {
       nav.dispose();
     });
   });
+
+  group('BATCH GPS-RATE: 1s Navigation-Grade Location Settings & 5000-Event Diagnostics Cap', () {
+    late FakeLocationService fakeLocation;
+    late FakeInProgressRideRepository fakeInProgressRepo;
+    late ActiveBikeController bikeController;
+    late FuelTrackerService fuelTracker;
+    late TrackingDiagnostics diagnostics;
+
+    setUp(() async {
+      SharedPreferences.setMockInitialValues({});
+      LocalStore.instance.resetForTesting();
+
+      fakeInProgressRepo = FakeInProgressRideRepository();
+      AppRepositories.resetWith(
+        bikeRepository: _FakeBikeRepository(),
+        rideReportRepository: FakeRideReportRepository(),
+        inProgressRideRepository: fakeInProgressRepo,
+      );
+
+      SettingsController.instance.resetForTesting();
+      bikeController = ActiveBikeController.instance;
+      bikeController.resetForTesting();
+
+      const testBike = Bike(
+        id: 'bike-gps-rate',
+        make: 'Yamaha',
+        modelName: 'Tenere 700',
+        modelYear: 2024,
+        odometerKm: 5000,
+        preciseOdometerKm: 5000.0,
+        fuelLevelOdometerKm: 5000.0,
+        fuelTankCapacityLiters: 16.0,
+        fuelAverageKmPerLiter: 20.0,
+        fuelRemainingLiters: 10.0,
+      );
+      bikeController.addBike(testBike, setActive: true);
+      await bikeController.flush();
+
+      fakeLocation = FakeLocationService();
+      fuelTracker = FuelTrackerService.instance;
+      fuelTracker.resetForTesting();
+      fuelTracker.setDependenciesForTesting(
+        locationService: fakeLocation,
+        bikeController: bikeController,
+        notificationService: _FakeFuelNotificationService(),
+        inProgressRideRepository: fakeInProgressRepo,
+      );
+
+      diagnostics = TrackingDiagnostics.instance;
+      diagnostics.clear();
+    });
+
+    tearDown(() {
+      fuelTracker.resetForTesting();
+      SettingsController.instance.resetForTesting();
+      diagnostics.clear();
+    });
+
+    test('1. GeolocatorLocationService.buildLocationSettings supports tracking mode and light mode with named constants', () async {
+      expect(
+        GeolocatorLocationService.trackingAccuracy,
+        LocationAccuracy.bestForNavigation,
+      );
+      expect(GeolocatorLocationService.trackingDistanceFilterMeters, 0);
+      expect(
+        GeolocatorLocationService.trackingInterval,
+        const Duration(seconds: 1),
+      );
+      expect(
+        GeolocatorLocationService.lightAccuracy,
+        LocationAccuracy.medium,
+      );
+      expect(GeolocatorLocationService.lightDistanceFilterMeters, 10);
+      expect(
+        GeolocatorLocationService.lightInterval,
+        isNull,
+      );
+
+      // Tracking mode: highAccuracy = true
+      final trackingSettings = GeolocatorLocationService.buildLocationSettings(
+        highAccuracy: true,
+        enableForegroundNotification: true,
+        forceLocationManager: false,
+      );
+      expect(trackingSettings, isA<AndroidSettings>());
+      final androidTracking = trackingSettings as AndroidSettings;
+      expect(androidTracking.accuracy, LocationAccuracy.bestForNavigation);
+      expect(androidTracking.distanceFilter, 0);
+      expect(androidTracking.intervalDuration, const Duration(seconds: 1));
+      expect(androidTracking.forceLocationManager, isFalse);
+      expect(androidTracking.foregroundNotificationConfig, isNotNull);
+
+      // Light mode: highAccuracy = false
+      final lightSettings = GeolocatorLocationService.buildLocationSettings(
+        highAccuracy: false,
+        forceLocationManager: true,
+      );
+      expect(lightSettings, isA<AndroidSettings>());
+      final androidLight = lightSettings as AndroidSettings;
+      expect(androidLight.accuracy, LocationAccuracy.medium);
+      expect(androidLight.distanceFilter, 10);
+      expect(androidLight.intervalDuration, isNull);
+      expect(androidLight.forceLocationManager, isTrue);
+
+      // Verify ride tracker subscribes with highAccuracy: true
+      await fuelTracker.startRide();
+      expect(fakeLocation.lastHighAccuracy, isTrue);
+      await fuelTracker.stopRide();
+
+      // Verify navigation subscribes with light mode in idle/preview, tracking mode while navigating, and switches back
+      final nav = NavigationController(
+        locationService: fakeLocation,
+        bikeController: bikeController,
+        routingService: FakeRoutingService(),
+      );
+      nav.startPositionStream();
+      expect(fakeLocation.lastHighAccuracy, isFalse, reason: 'Idle should be light mode');
+
+      // Preview mode
+      await nav.openRoutePreview(
+        const PlaceSearchResult(
+          name: 'Target Place',
+          displayName: 'Target Place, Lahore',
+          location: LatLng(33.6900, 73.0500),
+        ),
+      );
+      expect(fakeLocation.lastHighAccuracy, isFalse, reason: 'Preview should be light mode');
+
+      // Start navigation (RIDING)
+      await nav.startNavigation();
+      expect(fakeLocation.lastHighAccuracy, isTrue, reason: 'Navigating should be tracking mode');
+
+      // Stop navigation
+      nav.stopNavigation();
+      expect(fakeLocation.lastHighAccuracy, isFalse, reason: 'Stopped should switch back to light mode');
+
+      nav.dispose();
+
+      // CurrentPlaceController uses light mode
+      final placeController = CurrentPlaceController(
+        locationService: fakeLocation,
+      );
+      await placeController.initialize();
+      expect(fakeLocation.lastHighAccuracy, isFalse, reason: 'CurrentPlaceController should use light mode');
+      placeController.dispose();
+    });
+
+    test('2. TrackingDiagnostics enforces 5000-event cap and exports all 5000 events ordered oldest first with Location Settings header', () {
+      expect(TrackingDiagnostics.maxEvents, 5000);
+
+      final t0 = DateTime.utc(2026, 6, 1, 10, 0, 0);
+      // Record 5050 fixes (1 per second) so the oldest 50 are evicted and 5000 remain
+      for (int i = 0; i < 5050; i++) {
+        diagnostics.recordFix(
+          timestamp: t0.add(Duration(seconds: i)),
+          latitude: 33.68440 + (i * 0.00001),
+          longitude: 73.04790,
+          accuracy: 6.0,
+          speed: 10.0,
+          accepted: true,
+          reason: 'Fix #$i accepted',
+          segmentMeters: 1.1,
+        );
+      }
+
+      expect(diagnostics.events.length, 5000);
+      // In-memory events list is newest-first: index 0 is #5049, index 4999 is #50
+      expect(diagnostics.events.first.reason, 'Fix #5049 accepted');
+      expect(diagnostics.events.last.reason, 'Fix #50 accepted');
+
+      // Export with oldestFirst: true (used by Share log as file)
+      final exported = diagnostics.formatLogAsPlainText(oldestFirst: true);
+      expect(
+        exported,
+        contains(
+          'Location Settings: tracker=tracking (bestForNavigation, 1s, 0m), navigation=tracking (active) / light (idle), place=light (medium, default interval, 10m)',
+        ),
+      );
+      expect(
+        exported,
+        contains('=== EVENTS (5000 of 5000, oldest first) ==='),
+      );
+
+      final eventLines = exported
+          .split('\n')
+          .where((line) => line.contains('[ACCEPTED]'))
+          .toList();
+      expect(eventLines.length, 5000);
+      // Oldest retained event (#50) is first, newest event (#5049) is last
+      expect(eventLines.first, contains('Reason: Fix #50 accepted'));
+      expect(
+        eventLines.first,
+        contains(MotionMath.formatUtcIso8601(t0.add(const Duration(seconds: 50)))),
+      );
+      expect(eventLines.last, contains('Reason: Fix #5049 accepted'));
+      expect(
+        eventLines.last,
+        contains(
+          MotionMath.formatUtcIso8601(t0.add(const Duration(seconds: 5049))),
+        ),
+      );
+    });
+
+    testWidgets('3. TrackingDiagnosticsScreen renders 5000 events lazily without lagging and shows updated header', (tester) async {
+      final t0 = DateTime.utc(2026, 6, 1, 10, 0, 0);
+      for (int i = 0; i < 5000; i++) {
+        diagnostics.recordFix(
+          timestamp: t0.add(Duration(seconds: i)),
+          latitude: 33.68440 + (i * 0.00001),
+          longitude: 73.04790,
+          accuracy: 6.0,
+          speed: 10.0,
+          accepted: true,
+          reason: 'Fix #$i',
+          segmentMeters: 1.1,
+        );
+      }
+
+      await tester.pumpWidget(
+        const MaterialApp(
+          home: TrackingDiagnosticsScreen(isDebugMode: true),
+        ),
+      );
+      await tester.pump();
+
+      expect(
+        find.text('EVENT LOG (5000 of 5000, newest first)'),
+        findsOneWidget,
+      );
+      expect(find.text('Copy log'), findsOneWidget);
+      expect(find.text('Share log as file'), findsOneWidget);
+    });
+  });
+
+  group('BATCH GPS-RATE-3: Stream Ownership, Coordinator & Diagnostics', () {
+    late TrackingDiagnostics diagnostics;
+    late ActiveBikeController bikeController;
+
+    setUp(() async {
+      SharedPreferences.setMockInitialValues({});
+      LocalStore.instance.resetForTesting();
+
+      AppRepositories.resetWith(
+        bikeRepository: _FakeBikeRepository(),
+        rideReportRepository: FakeRideReportRepository(),
+        inProgressRideRepository: FakeInProgressRideRepository(),
+      );
+
+      SettingsController.instance.resetForTesting();
+      bikeController = ActiveBikeController.instance;
+      bikeController.resetForTesting();
+      bikeController.addBike(
+        const Bike(
+          id: 'bike-stream-1',
+          make: 'Honda',
+          modelName: 'CB150F',
+          modelYear: 2024,
+          odometerKm: 1000,
+          preciseOdometerKm: 1000.0,
+          fuelLevelOdometerKm: 1000.0,
+          fuelTankCapacityLiters: 13.0,
+          fuelAverageKmPerLiter: 42.0,
+          fuelRemainingLiters: 10.0,
+        ),
+        setActive: true,
+      );
+      await bikeController.flush();
+
+      diagnostics = TrackingDiagnostics.instance;
+      diagnostics.clear();
+      FuelTrackerService.instance.resetForTesting();
+    });
+
+    tearDown(() {
+      debugDefaultTargetPlatformOverride = null;
+      FuelTrackerService.instance.resetForTesting();
+      SettingsController.instance.resetForTesting();
+      diagnostics.clear();
+    });
+
+    test(
+      '1. PositionStreamCoordinator promotes shared native stream to AndroidSettings tracking mode across cases (a)-(d) even when place opens light mode first',
+      () async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.android;
+
+        final List<LocationSettings> openedSettings = [];
+        int cancelledCount = 0;
+        final List<StreamController<PositionData>> openedControllers = [];
+        StreamController<PositionData>? upstreamController;
+        addTearDown(() async {
+          for (final c in openedControllers) {
+            if (!c.isClosed) {
+              await c.close();
+            }
+          }
+        });
+
+        final coordinator = PositionStreamCoordinator(
+          openUpstream: (settings) {
+            openedSettings.add(settings);
+            final controller = StreamController<PositionData>(
+              onCancel: () {
+                cancelledCount++;
+              },
+            );
+            openedControllers.add(controller);
+            upstreamController = controller;
+            return controller.stream;
+          },
+          logStreamEvent: ({
+            required String action,
+            required String owner,
+            required String mode,
+            required String settingsSummary,
+          }) {
+            diagnostics.recordStreamEvent(
+              action: action,
+              owner: owner,
+              mode: mode,
+              settingsSummary: settingsSummary,
+            );
+          },
+        );
+
+        // Case (a) Free ride: place opens light stream first, then tracker starts ride.
+        final placeSub = coordinator
+            .subscribe(
+              owner: LocationStreamOwner.place,
+              highAccuracy: false,
+              enableForegroundNotification: false,
+            )
+            .listen((_) {});
+        await Future<void>.delayed(Duration.zero);
+
+        expect(openedSettings.length, 1);
+        expect(openedSettings.last, isA<AndroidSettings>());
+        final placeAndroid = openedSettings.last as AndroidSettings;
+        expect(placeAndroid.accuracy, LocationAccuracy.medium);
+        expect(placeAndroid.distanceFilter, 10);
+        expect(placeAndroid.intervalDuration, isNull);
+        expect(coordinator.activeModeLabel, 'light');
+
+        // Tracker starts free ride: coordinator MUST cancel light native stream and open tracking mode.
+        final List<PositionData> trackerFixes = [];
+        final trackerSub = coordinator
+            .subscribe(
+              owner: LocationStreamOwner.tracker,
+              highAccuracy: true,
+              enableForegroundNotification: true,
+            )
+            .listen(trackerFixes.add);
+        await Future<void>.delayed(Duration.zero);
+
+        expect(cancelledCount, 1);
+        expect(openedSettings.length, 2);
+        final trackerAndroid = openedSettings.last as AndroidSettings;
+        expect(trackerAndroid.accuracy, LocationAccuracy.bestForNavigation);
+        expect(trackerAndroid.distanceFilter, 0);
+        expect(trackerAndroid.intervalDuration, const Duration(seconds: 1));
+        expect(trackerAndroid.foregroundNotificationConfig, isNotNull);
+        expect(coordinator.activeModeLabel, 'tracking');
+        expect(
+          coordinator.streamSourceTagFor(LocationStreamOwner.tracker),
+          'tracker:tracking',
+        );
+
+        upstreamController!.add(
+          PositionData(
+            latitude: 33.6844,
+            longitude: 73.0479,
+            speed: 12.0,
+            accuracy: 4.0,
+            timestamp: DateTime.utc(2026, 11, 14, 10, 0, 0),
+          ),
+        );
+        await Future<void>.delayed(Duration.zero);
+        expect(trackerFixes.length, 1);
+
+        // Stop free ride -> reverts cleanly to light mode for place.
+        await trackerSub.cancel();
+        await Future<void>.delayed(Duration.zero);
+        expect(cancelledCount, 2);
+        expect(openedSettings.length, 3);
+        expect((openedSettings.last as AndroidSettings).accuracy,
+            LocationAccuracy.medium);
+        expect(coordinator.activeModeLabel, 'light');
+
+        // Case (b) Ride started with navigation: navigation in idle/preview -> navigating -> tracker joins.
+        var navSub = coordinator
+            .subscribe(
+              owner: LocationStreamOwner.navigation,
+              highAccuracy: false,
+              enableForegroundNotification: false,
+            )
+            .listen((_) {});
+        await Future<void>.delayed(Duration.zero);
+        expect(openedSettings.length, 3,
+            reason: 'Joining in light mode reuses active light upstream');
+
+        await navSub.cancel();
+        navSub = coordinator
+            .subscribe(
+              owner: LocationStreamOwner.navigation,
+              highAccuracy: true,
+              enableForegroundNotification: false,
+            )
+            .listen((_) {});
+        await Future<void>.delayed(Duration.zero);
+        expect(openedSettings.length, 4);
+        expect((openedSettings.last as AndroidSettings).accuracy,
+            LocationAccuracy.bestForNavigation);
+
+        final trackerSub2 = coordinator
+            .subscribe(
+              owner: LocationStreamOwner.tracker,
+              highAccuracy: true,
+              enableForegroundNotification: true,
+            )
+            .listen((_) {});
+        await Future<void>.delayed(Duration.zero);
+        expect(openedSettings.length, 5);
+        expect(
+            (openedSettings.last as AndroidSettings).foregroundNotificationConfig,
+            isNotNull);
+
+        // Case (d) Navigation stopped mid-ride: navigation drops back to light, tracker keeps tracking mode!
+        await navSub.cancel();
+        navSub = coordinator
+            .subscribe(
+              owner: LocationStreamOwner.navigation,
+              highAccuracy: false,
+              enableForegroundNotification: false,
+            )
+            .listen((_) {});
+        await Future<void>.delayed(Duration.zero);
+        expect(openedSettings.length, 5,
+            reason:
+                'Must NOT downgrade to light while tracker is still riding');
+        expect(coordinator.activeModeLabel, 'tracking');
+        expect(
+            (openedSettings.last as AndroidSettings).foregroundNotificationConfig,
+            isNotNull);
+
+        // Tracker ends ride -> now reverts to light mode for place + idle nav.
+        await trackerSub2.cancel();
+        await Future<void>.delayed(Duration.zero);
+        expect(openedSettings.length, 6);
+        expect(coordinator.activeModeLabel, 'light');
+
+        // Case (c) Navigation started while a ride is running: tracker starts -> nav upgrades to tracking.
+        final trackerSub3 = coordinator
+            .subscribe(
+              owner: LocationStreamOwner.tracker,
+              highAccuracy: true,
+              enableForegroundNotification: true,
+            )
+            .listen((_) {});
+        await Future<void>.delayed(Duration.zero);
+        expect(openedSettings.length, 7);
+        expect(coordinator.activeModeLabel, 'tracking');
+
+        await navSub.cancel();
+        navSub = coordinator
+            .subscribe(
+              owner: LocationStreamOwner.navigation,
+              highAccuracy: true,
+              enableForegroundNotification: false,
+            )
+            .listen((_) {});
+        await Future<void>.delayed(Duration.zero);
+        expect(openedSettings.length, 7,
+            reason: 'Tracker already holds tracking+fgNotif upstream');
+        expect(coordinator.activeModeLabel, 'tracking');
+
+        await trackerSub3.cancel();
+        await navSub.cancel();
+        await placeSub.cancel();
+        await Future<void>.delayed(Duration.zero);
+        expect(coordinator.activeLeaseCount, 0);
+        expect(coordinator.activeModeLabel, 'idle');
+
+        await coordinator.reset();
+      },
+    );
+
+    test(
+      '2. FuelTrackerService + NavigationController + CurrentPlaceController log [STREAM], [tracker:tracking] fix tags, and median/max inter-fix gaps',
+      () async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.android;
+
+        final List<StreamController<PositionData>> openedControllers = [];
+        StreamController<PositionData>? upstreamController;
+        addTearDown(() async {
+          for (final c in openedControllers) {
+            if (!c.isClosed) {
+              await c.close();
+            }
+          }
+        });
+        final coordinator = PositionStreamCoordinator(
+          openUpstream: (settings) {
+            final controller = StreamController<PositionData>();
+            openedControllers.add(controller);
+            upstreamController = controller;
+            return controller.stream;
+          },
+          logStreamEvent: ({
+            required String action,
+            required String owner,
+            required String mode,
+            required String settingsSummary,
+          }) {
+            diagnostics.recordStreamEvent(
+              action: action,
+              owner: owner,
+              mode: mode,
+              settingsSummary: settingsSummary,
+            );
+          },
+        );
+        final managedLocation = _ManagedFakeLocationService(
+          coordinator: coordinator,
+          currentPos: PositionData(
+            latitude: 33.6844,
+            longitude: 73.0479,
+            accuracy: 5.0,
+            speed: 0.0,
+            timestamp: DateTime.utc(2026, 11, 14, 11, 0, 0),
+          ),
+        );
+
+        final placeController =
+            CurrentPlaceController(locationService: managedLocation);
+        await placeController.initialize();
+        await Future<void>.delayed(Duration.zero);
+        expect(coordinator.activeModeLabel, 'light');
+
+        final tracker = FuelTrackerService.instance;
+        tracker.setDependenciesForTesting(
+          bikeController: bikeController,
+          locationService: managedLocation,
+          notificationService: _FakeFuelNotificationService(),
+          inProgressRideRepository: FakeInProgressRideRepository(),
+        );
+        final started = await tracker.startRide();
+        expect(started, isTrue);
+        await Future<void>.delayed(Duration.zero);
+        expect(coordinator.activeModeLabel, 'tracking');
+
+        final t0 = DateTime.utc(2026, 11, 14, 11, 0, 10);
+        // Emit 3 fixes with gaps 1.0 s and 3.0 s (median = 2.00 s, max = 3.0 s)
+        upstreamController!.add(PositionData(
+          latitude: 33.68440,
+          longitude: 73.04790,
+          accuracy: 4.0,
+          speed: 10.0,
+          timestamp: t0,
+        ));
+        upstreamController!.add(PositionData(
+          latitude: 33.68450,
+          longitude: 73.04790,
+          accuracy: 4.0,
+          speed: 10.0,
+          timestamp: t0.add(const Duration(seconds: 1)),
+        ));
+        upstreamController!.add(PositionData(
+          latitude: 33.68480,
+          longitude: 73.04790,
+          accuracy: 4.0,
+          speed: 10.0,
+          timestamp: t0.add(const Duration(seconds: 4)),
+        ));
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+
+        final nav = NavigationController(
+          locationService: managedLocation,
+          routingService: FakeRoutingService(),
+          bikeController: bikeController,
+        );
+        await nav.openRoutePreview(const PlaceSearchResult(
+          name: 'Dest',
+          displayName: 'Dest Point',
+          location: LatLng(33.70, 73.05),
+        ));
+        await nav.startNavigation();
+        await Future<void>.delayed(Duration.zero);
+        expect(coordinator.activeModeLabel, 'tracking');
+
+        nav.stopNavigation();
+        await Future<void>.delayed(Duration.zero);
+        expect(coordinator.activeModeLabel, 'tracking',
+            reason: 'Tracker still active after nav stopped mid-ride');
+
+        await tracker.stopRide();
+        await Future<void>.delayed(Duration.zero);
+        expect(coordinator.activeModeLabel, 'light');
+
+        final summary = diagnostics.computeSummary();
+        expect(summary.totalFixes, 3);
+        expect(summary.medianInterFixGapSeconds, closeTo(2.0, 0.01));
+        expect(summary.maxInterFixGapSeconds, closeTo(3.0, 0.01));
+
+        final log = diagnostics.formatLogAsPlainText(oldestFirst: true);
+        expect(log, contains('- Inter-Fix Gap (Median): 2.00 s'));
+        expect(log, contains('- Inter-Fix Gap (Max): 3.0 s'));
+        expect(log, contains('[STREAM] created | owner=place | mode=light'));
+        expect(log, contains('[STREAM] created | owner=tracker | mode=tracking'));
+        expect(
+          log,
+          contains(
+            'AndroidSettings(acc=bestForNavigation, dist=0m, interval=1000ms, forceLocMgr=false, fgNotif=false)',
+          ),
+        );
+        expect(log, contains('[STREAM] first_fix | owner=native | mode=tracking | delay='));
+        expect(log, contains('[ACCEPTED] [tracker:tracking]'));
+        expect(log, contains('[STREAM] stopped | owner=tracker | mode=tracking'));
+
+        nav.dispose();
+        tracker.resetForTesting();
+        placeController.dispose();
+        await coordinator.reset();
+      },
+    );
+  });
+
+  group('BATCH GPS-RATE-4: No-fix watchdog, restart delivery, and error logging', () {
+    late ActiveBikeController bikeController;
+
+    setUp(() async {
+      SharedPreferences.setMockInitialValues({});
+      LocalStore.instance.resetForTesting();
+
+      AppRepositories.resetWith(
+        bikeRepository: _FakeBikeRepository(),
+        rideReportRepository: FakeRideReportRepository(),
+        inProgressRideRepository: FakeInProgressRideRepository(),
+      );
+
+      SettingsController.instance.resetForTesting();
+      bikeController = ActiveBikeController.instance;
+      bikeController.resetForTesting();
+      bikeController.addBike(
+        const Bike(
+          id: 'bike-gps-rate-4',
+          make: 'Honda',
+          modelName: 'CB150F',
+          modelYear: 2024,
+          odometerKm: 1000,
+          preciseOdometerKm: 1000.0,
+          fuelLevelOdometerKm: 1000.0,
+          fuelTankCapacityLiters: 13.0,
+          fuelAverageKmPerLiter: 42.0,
+          fuelRemainingLiters: 10.0,
+        ),
+        setActive: true,
+      );
+      await bikeController.flush();
+
+      TrackingDiagnostics.instance.clear();
+      FuelTrackerService.instance.resetForTesting();
+    });
+
+    tearDown(() {
+      debugDefaultTargetPlatformOverride = null;
+      FuelTrackerService.instance.resetForTesting();
+      SettingsController.instance.resetForTesting();
+      TrackingDiagnostics.instance.clear();
+    });
+
+    test(
+      'Native restart delivers fixes to ALL active subscribers and logs first_fix delay in ms',
+      () async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.android;
+        DateTime fakeNow = DateTime.utc(2026, 11, 14, 17, 31, 29, 0);
+        final List<StreamController<PositionData>> openedControllers =
+            <StreamController<PositionData>>[];
+        StreamController<PositionData>? upstreamController;
+        addTearDown(() async {
+          for (final c in openedControllers) {
+            if (!c.isClosed) {
+              await c.close();
+            }
+          }
+        });
+        final List<LocationSettings> openedSettings = <LocationSettings>[];
+        final List<Map<String, String>> loggedEvents = <Map<String, String>>[];
+
+        final coordinator = PositionStreamCoordinator(
+          now: () => fakeNow,
+          watchdogTimeout: const Duration(seconds: 15),
+          openUpstream: (settings) {
+            openedSettings.add(settings);
+            final controller = StreamController<PositionData>();
+            openedControllers.add(controller);
+            upstreamController = controller;
+            return controller.stream;
+          },
+          logStreamEvent: ({
+            required String action,
+            required String owner,
+            required String mode,
+            required String settingsSummary,
+          }) {
+            loggedEvents.add(<String, String>{
+              'action': action,
+              'owner': owner,
+              'mode': mode,
+              'summary': settingsSummary,
+            });
+          },
+        );
+
+        final List<PositionData> placeFixes = <PositionData>[];
+        final List<PositionData> trackerFixes = <PositionData>[];
+        final List<PositionData> navFixes = <PositionData>[];
+
+        final placeSub = coordinator
+            .subscribe(
+              owner: LocationStreamOwner.place,
+              highAccuracy: false,
+              enableForegroundNotification: false,
+              forceLocationManager: false,
+            )
+            .listen(placeFixes.add);
+        await Future<void>.delayed(Duration.zero);
+        expect(openedSettings.length, 1);
+
+        // Subscribe tracker and navigation -> triggers native restart to tracking mode
+        fakeNow = DateTime.utc(2026, 11, 14, 17, 31, 36, 0);
+        final trackerSub = coordinator
+            .subscribe(
+              owner: LocationStreamOwner.tracker,
+              highAccuracy: true,
+              enableForegroundNotification: false,
+              forceLocationManager: false,
+            )
+            .listen(trackerFixes.add);
+        final navSub = coordinator
+            .subscribe(
+              owner: LocationStreamOwner.navigation,
+              highAccuracy: true,
+              enableForegroundNotification: false,
+              forceLocationManager: false,
+            )
+            .listen(navFixes.add);
+        await Future<void>.delayed(Duration.zero);
+        expect(openedSettings.length, 2);
+
+        // Advance clock by 420 ms and emit first fix on restarted native stream
+        fakeNow = DateTime.utc(2026, 11, 14, 17, 31, 36, 420);
+        final fix1 = PositionData(
+          latitude: 33.6844,
+          longitude: 73.0479,
+          accuracy: 3.9,
+          speed: 8.5,
+          timestamp: fakeNow,
+        );
+        upstreamController!.add(fix1);
+        await Future<void>.delayed(Duration.zero);
+
+        // All three subscribers (place, tracker, navigation) receive the fix
+        expect(placeFixes.length, 1);
+        expect(trackerFixes.length, 1);
+        expect(navFixes.length, 1);
+
+        final firstFixEvents =
+            loggedEvents.where((e) => e['action'] == 'first_fix').toList();
+        expect(firstFixEvents.length, 1);
+        expect(firstFixEvents.single['owner'], 'native');
+        expect(firstFixEvents.single['mode'], 'tracking');
+        expect(firstFixEvents.single['summary'], startsWith('delay=420ms | '));
+
+        await placeSub.cancel();
+        await trackerSub.cancel();
+        await navSub.cancel();
+        await coordinator.reset();
+      },
+    );
+
+    test(
+      'Watchdog logs after 15 s, restarts once with fgNotif=false, and marks hasNoLocationUpdates after second 15 s',
+      () async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.android;
+        final List<LocationSettings> openedSettings = <LocationSettings>[];
+        final List<StreamController<PositionData>> openedControllers =
+            <StreamController<PositionData>>[];
+        StreamController<PositionData>? activeUpstreamController;
+        addTearDown(() async {
+          for (final c in openedControllers) {
+            if (!c.isClosed) {
+              await c.close();
+            }
+          }
+        });
+        final diagnostics = TrackingDiagnostics.instance;
+
+        final coordinator = PositionStreamCoordinator(
+          watchdogTimeout: const Duration(milliseconds: 25),
+          openUpstream: (settings) {
+            openedSettings.add(settings);
+            final controller = StreamController<PositionData>();
+            openedControllers.add(controller);
+            activeUpstreamController = controller;
+            return controller.stream;
+          },
+          logStreamEvent: ({
+            required String action,
+            required String owner,
+            required String mode,
+            required String settingsSummary,
+          }) {
+            diagnostics.recordStreamEvent(
+              action: action,
+              owner: owner,
+              mode: mode,
+              settingsSummary: settingsSummary,
+            );
+          },
+        );
+
+        final managedLocation = _ManagedFakeLocationService(
+          coordinator: coordinator,
+        );
+
+        final tracker = FuelTrackerService.instance;
+        tracker.setDependenciesForTesting(
+          locationService: managedLocation,
+          bikeController: bikeController,
+          notificationService: _FakeFuelNotificationService(),
+          inProgressRideRepository: FakeInProgressRideRepository(),
+        );
+
+        final started = await tracker.startRide();
+        expect(started, isTrue);
+        await Future<void>.delayed(Duration.zero);
+        expect(openedSettings.length, 1);
+        expect(tracker.hasNoLocationUpdates, isFalse);
+
+        // Wait for first watchdog timeout (attempt 1 -> restarts with fgNotif=false)
+        for (int i = 0; i < 20 && openedSettings.length < 2; i++) {
+          await Future<void>.delayed(const Duration(milliseconds: 15));
+        }
+        expect(
+          openedSettings.length,
+          2,
+          reason: 'Watchdog attempt 1 must restart the native stream once',
+        );
+        final retrySettings = openedSettings.last as AndroidSettings;
+        expect(retrySettings.foregroundNotificationConfig, isNull);
+        expect(tracker.hasNoLocationUpdates, isFalse);
+
+        // Wait for second watchdog timeout (attempt 2 -> marks hasNoLocationUpdates)
+        for (int i = 0; i < 20 && !tracker.hasNoLocationUpdates; i++) {
+          await Future<void>.delayed(const Duration(milliseconds: 15));
+        }
+        expect(coordinator.hasNoLocationUpdates, isTrue);
+        expect(tracker.hasNoLocationUpdates, isTrue);
+
+        final log = diagnostics.formatLogAsPlainText(oldestFirst: true);
+        expect(
+          log,
+          contains(
+            '[STREAM] watchdog | owner=native | mode=tracking | no fix within 0s (restarting with fgNotif=false)',
+          ),
+        );
+        expect(
+          log,
+          contains(
+            '[STREAM] watchdog | owner=native | mode=tracking | no fix within 0s (no location updates after retry)',
+          ),
+        );
+
+        // Delivering a real fix immediately clears hasNoLocationUpdates
+        activeUpstreamController!.add(PositionData(
+          latitude: 33.6844,
+          longitude: 73.0479,
+          accuracy: 4.0,
+          speed: 6.0,
+          timestamp: DateTime.utc(2026, 11, 14, 17, 35, 0),
+        ));
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        expect(coordinator.hasNoLocationUpdates, isFalse);
+        expect(tracker.hasNoLocationUpdates, isFalse);
+
+        await tracker.stopRide();
+        await coordinator.reset();
+      },
+    );
+
+    test(
+      'onError and onDone are logged in [STREAM] events and errors propagate to all subscribers',
+      () async {
+        debugDefaultTargetPlatformOverride = TargetPlatform.android;
+        final List<StreamController<PositionData>> openedControllers =
+            <StreamController<PositionData>>[];
+        StreamController<PositionData>? upstreamController;
+        addTearDown(() async {
+          for (final c in openedControllers) {
+            if (!c.isClosed) {
+              await c.close();
+            }
+          }
+        });
+        final List<Map<String, String>> loggedEvents = <Map<String, String>>[];
+
+        final coordinator = PositionStreamCoordinator(
+          openUpstream: (settings) {
+            final controller = StreamController<PositionData>();
+            openedControllers.add(controller);
+            upstreamController = controller;
+            return controller.stream;
+          },
+          logStreamEvent: ({
+            required String action,
+            required String owner,
+            required String mode,
+            required String settingsSummary,
+          }) {
+            loggedEvents.add(<String, String>{
+              'action': action,
+              'owner': owner,
+              'mode': mode,
+              'summary': settingsSummary,
+            });
+          },
+        );
+
+        final List<Object> placeErrors = <Object>[];
+        final List<Object> trackerErrors = <Object>[];
+
+        final placeSub = coordinator
+            .subscribe(
+              owner: LocationStreamOwner.place,
+              highAccuracy: false,
+              enableForegroundNotification: false,
+              forceLocationManager: false,
+            )
+            .listen((_) {}, onError: (Object e, StackTrace _) {
+          placeErrors.add(e);
+        });
+        final trackerSub = coordinator
+            .subscribe(
+              owner: LocationStreamOwner.tracker,
+              highAccuracy: true,
+              enableForegroundNotification: false,
+              forceLocationManager: false,
+            )
+            .listen((_) {}, onError: (Object e, StackTrace _) {
+          trackerErrors.add(e);
+        });
+        await Future<void>.delayed(Duration.zero);
+
+        upstreamController!.addError(
+          StateError('SecurityException: missing WAKE_LOCK'),
+        );
+        await Future<void>.delayed(Duration.zero);
+
+        expect(placeErrors.length, 1);
+        expect(trackerErrors.length, 1);
+        expect(
+          placeErrors.single.toString(),
+          contains('SecurityException: missing WAKE_LOCK'),
+        );
+        expect(
+          trackerErrors.single.toString(),
+          contains('SecurityException: missing WAKE_LOCK'),
+        );
+
+        final errorLogs =
+            loggedEvents.where((e) => e['action'] == 'error').toList();
+        expect(errorLogs.length, 1);
+        expect(errorLogs.single['owner'], 'native');
+        expect(errorLogs.single['mode'], 'tracking');
+        expect(
+          errorLogs.single['summary'],
+          contains('error=Bad state: SecurityException: missing WAKE_LOCK'),
+        );
+
+        await upstreamController!.close();
+        await Future<void>.delayed(Duration.zero);
+
+        final doneLogs =
+            loggedEvents.where((e) => e['action'] == 'done').toList();
+        expect(doneLogs.length, 1);
+        expect(doneLogs.single['owner'], 'native');
+        expect(doneLogs.single['summary'], contains('message=stream closed'));
+
+        await placeSub.cancel();
+        await trackerSub.cancel();
+        await coordinator.reset();
+      },
+    );
+
+    testWidgets(
+      'ActiveBikeCardWidget shows "No location updates" instead of "0.0 km tracked" when watchdog triggers',
+      (WidgetTester tester) async {
+        final List<StreamController<PositionData>> openedControllers =
+            <StreamController<PositionData>>[];
+        addTearDown(() async {
+          for (final c in openedControllers) {
+            if (!c.isClosed) {
+              await c.close();
+            }
+          }
+        });
+        final coordinator = PositionStreamCoordinator(
+          watchdogTimeout: const Duration(milliseconds: 40),
+          openUpstream: (settings) {
+            final controller = StreamController<PositionData>();
+            openedControllers.add(controller);
+            return controller.stream;
+          },
+        );
+        final managedLocation = _ManagedFakeLocationService(
+          coordinator: coordinator,
+        );
+
+        final tracker = FuelTrackerService.instance;
+        tracker.setDependenciesForTesting(
+          locationService: managedLocation,
+          bikeController: bikeController,
+          notificationService: _FakeFuelNotificationService(),
+          inProgressRideRepository: FakeInProgressRideRepository(),
+        );
+
+        await tester.pumpWidget(
+          const MaterialApp(
+            home: Scaffold(
+              body: SingleChildScrollView(
+                child: ActiveBikeCardWidget(),
+              ),
+            ),
+          ),
+        );
+        await tester.pump();
+
+        await tracker.startRide();
+        await tester.pump();
+        expect(find.text('0.0 km tracked'), findsOneWidget);
+        expect(find.text('No location updates'), findsNothing);
+
+        // Elapse first 40 ms watchdog (restarts stream) + second 40 ms watchdog
+        await tester.pump(const Duration(milliseconds: 50));
+        await tester.pump(const Duration(milliseconds: 50));
+
+        expect(tracker.hasNoLocationUpdates, isTrue);
+        expect(find.text('No location updates'), findsOneWidget);
+        expect(find.text('0.0 km tracked'), findsNothing);
+
+        await tracker.stopRide();
+        await coordinator.reset();
+        await tester.pump();
+      },
+    );
+  });
+}
+
+class _ManagedFakeLocationService extends GeolocatorLocationService {
+  const _ManagedFakeLocationService({
+    required PositionStreamCoordinator coordinator,
+    this.currentPos,
+  }) : super(coordinator: coordinator);
+
+  final PositionData? currentPos;
+
+  @override
+  Future<bool> isLocationServiceEnabled() async => true;
+
+  @override
+  Future<bool> checkPermission() async => true;
+
+  @override
+  Future<bool> requestPermission() async => true;
+
+  @override
+  Future<PositionData?> getCurrentPosition() async => currentPos;
+
+  @override
+  Future<PositionData?> getLastKnownPosition() async => currentPos;
 }
 

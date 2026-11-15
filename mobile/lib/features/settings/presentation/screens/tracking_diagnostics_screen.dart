@@ -24,10 +24,14 @@ class TrackingDiagnosticsScreen extends StatefulWidget {
   const TrackingDiagnosticsScreen({
     super.key,
     this.isDebugMode = kDebugMode,
+    this.onShareFile,
   });
 
   /// Allows unit and widget tests to verify debug-mode visibility without modifying lib/ code.
   final bool isDebugMode;
+
+  /// Optional share file callback (invoked with temp file path and popover origin; defaults to [SharePlus.instance.share]).
+  final Future<void> Function(String filePath, Rect? origin)? onShareFile;
 
   @override
   State<TrackingDiagnosticsScreen> createState() =>
@@ -113,13 +117,14 @@ class _TrackingDiagnosticsScreenState extends State<TrackingDiagnosticsScreen> {
   /// to a temporary file named `camp_log_<UTC timestamp>.txt` and presents
   /// the system share sheet. Shows a SnackBar if saving or sharing fails.
   Future<void> _shareLogAsFile(BuildContext context) async {
-    // Determine anchor rect before any async gap to satisfy use_build_context_synchronously
-    final box = context.findRenderObject() as RenderBox?;
-    final origin = box != null
-        ? (box.localToGlobal(Offset.zero) & box.size)
-        : null;
-
     try {
+      // Safely determine anchor rect for iPad/Mac popovers if render object is a RenderBox
+      final renderObj = context.findRenderObject();
+      final box = renderObj is RenderBox ? renderObj : null;
+      final origin = box != null && box.hasSize
+          ? (box.localToGlobal(Offset.zero) & box.size)
+          : null;
+
       final text = TrackingDiagnostics.instance.formatLogAsPlainText(
         maxAccuracyMeters: FuelTrackerService.maxAccuracyMeters,
         minDistanceMeters: FuelTrackerService.minDistanceMeters,
@@ -138,13 +143,17 @@ class _TrackingDiagnosticsScreenState extends State<TrackingDiagnosticsScreen> {
       final file = File('${tempDir.path}/$fileName');
       await file.writeAsString(text, flush: true);
 
-      await SharePlus.instance.share(
-        ShareParams(
-          files: [XFile(file.path, mimeType: 'text/plain')],
-          subject: 'CAMP Tracking Diagnostics Log',
-          sharePositionOrigin: origin,
-        ),
-      );
+      if (widget.onShareFile != null) {
+        await widget.onShareFile!(file.path, origin);
+      } else {
+        await SharePlus.instance.share(
+          ShareParams(
+            files: [XFile(file.path, mimeType: 'text/plain')],
+            subject: 'CAMP Tracking Diagnostics Log',
+            sharePositionOrigin: origin,
+          ),
+        );
+      }
     } catch (e) {
       if (!context.mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -194,24 +203,33 @@ class _TrackingDiagnosticsScreenState extends State<TrackingDiagnosticsScreen> {
           final diag = TrackingDiagnostics.instance;
           final events = diag.events;
 
-          return ListView(
+          // Lazily build event rows so the screen stays smooth with up to 5000 events.
+          return ListView.builder(
             padding: const EdgeInsets.fromLTRB(16, 16, 16, 80),
-            children: [
-              _buildSystemStatusCard(),
-              const SizedBox(height: 12),
-              _buildLiveMetricsCard(diag),
-              const SizedBox(height: 12),
-              _buildFilterThresholdsCard(),
-              const SizedBox(height: 16),
-              _buildActionsRow(context, diag),
-              const SizedBox(height: 16),
-              _buildEventLogHeader(events.length),
-              const SizedBox(height: 8),
-              if (events.isEmpty)
-                _buildEmptyState()
-              else
-                ...events.map(_buildEventTile),
-            ],
+            itemCount: 1 + (events.isEmpty ? 1 : events.length),
+            itemBuilder: (context, index) {
+              if (index == 0) {
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    _buildSystemStatusCard(),
+                    const SizedBox(height: 12),
+                    _buildLiveMetricsCard(diag),
+                    const SizedBox(height: 12),
+                    _buildFilterThresholdsCard(),
+                    const SizedBox(height: 16),
+                    _buildActionsRow(context, diag),
+                    const SizedBox(height: 16),
+                    _buildEventLogHeader(events.length),
+                    const SizedBox(height: 8),
+                  ],
+                );
+              }
+              if (events.isEmpty) {
+                return _buildEmptyState();
+              }
+              return _buildEventTile(events[index - 1]);
+            },
           );
         },
       ),
@@ -511,34 +529,36 @@ class _TrackingDiagnosticsScreenState extends State<TrackingDiagnosticsScreen> {
         ),
         const SizedBox(width: 8),
         Expanded(
-          child: ElevatedButton(
-            key: const ValueKey('tracking_diag_share_file_button'),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: AppColors.darkCharcoal,
-              foregroundColor: Colors.white,
-              minimumSize: const Size(0, 44),
-              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-              padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 6),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(AppColors.radiusCard),
+          child: Builder(
+            builder: (btnContext) => ElevatedButton(
+              key: const ValueKey('tracking_diag_share_file_button'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: AppColors.darkCharcoal,
+                foregroundColor: Colors.white,
+                minimumSize: const Size(0, 44),
+                tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 6),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(AppColors.radiusCard),
+                ),
               ),
-            ),
-            onPressed: () => _shareLogAsFile(context),
-            child: FittedBox(
-              fit: BoxFit.scaleDown,
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Icon(Icons.share_rounded, size: 16),
-                  const SizedBox(width: 4),
-                  Text(
-                    'Share log as file',
-                    style: GoogleFonts.manrope(
-                      fontSize: 12,
-                      fontWeight: FontWeight.w700,
+              onPressed: () => _shareLogAsFile(btnContext),
+              child: FittedBox(
+                fit: BoxFit.scaleDown,
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.share_rounded, size: 16),
+                    const SizedBox(width: 4),
+                    Text(
+                      'Share log as file',
+                      style: GoogleFonts.manrope(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                      ),
                     ),
-                  ),
-                ],
+                  ],
+                ),
               ),
             ),
           ),
@@ -723,13 +743,15 @@ class _TrackingDiagnosticsScreenState extends State<TrackingDiagnosticsScreen> {
       );
     }
 
-    // 3. State Change / Off-Route / Reroute Event
+    // 3. State Change / Off-Route / Reroute / Stream Event
     if (event.type == TrackingEventType.trackerState ||
         event.type == TrackingEventType.offRoute ||
-        event.type == TrackingEventType.reroute) {
+        event.type == TrackingEventType.reroute ||
+        event.type == TrackingEventType.stream) {
       final prefix = switch (event.type) {
         TrackingEventType.offRoute => 'OFF-ROUTE',
         TrackingEventType.reroute => 'REROUTE',
+        TrackingEventType.stream => 'STREAM',
         _ => 'TRACKER STATE',
       };
       return Container(

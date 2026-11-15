@@ -14,7 +14,6 @@ import '../../settings/controllers/settings_controller.dart';
 import '../domain/geocoding_service.dart';
 import '../domain/location_service.dart';
 import '../domain/motion_math.dart';
-import '../domain/places_poi_service.dart';
 import '../domain/route_progress.dart';
 import '../domain/routing_service.dart';
 import 'current_place_controller.dart';
@@ -59,7 +58,6 @@ class NavigationController extends ChangeNotifier {
     LocationService? locationService,
     RoutingService? routingService,
     GeocodingService? geocodingService,
-    PlacesPoiService? placesPoiService,
     ActiveBikeController? bikeController,
     PlaceRepository? placeRepository,
     CurrentPlaceController? currentPlaceController,
@@ -67,7 +65,6 @@ class NavigationController extends ChangeNotifier {
         _locationService = locationService ?? const GeolocatorLocationService(),
         _routingService = routingService ?? OsrmRoutingService(),
         _geocodingService = geocodingService ?? NominatimGeocodingService(),
-        _placesPoiService = placesPoiService ?? PlacesPoiService(),
         _bikeController = bikeController ?? ActiveBikeController.instance,
         _ownsCurrentPlaceController = currentPlaceController != null ||
             locationService != null ||
@@ -94,7 +91,6 @@ class NavigationController extends ChangeNotifier {
   final LocationService _locationService;
   final RoutingService _routingService;
   final GeocodingService _geocodingService;
-  final PlacesPoiService _placesPoiService;
   final ActiveBikeController _bikeController;
   final PlaceRepository? _placeRepositoryOverride;
   final CurrentPlaceController _currentPlaceController;
@@ -173,6 +169,34 @@ class NavigationController extends ChangeNotifier {
   /// Relaxed OSRM start waypoint snapping radius in meters (`100 m`) used on immediate retry.
   static const double rerouteRelaxedStartRadiusMeters = 100.0;
 
+  /// Maximum map rotation turn rate in degrees per second (`90°/s`) during RIDING follow mode.
+  static const double maxRotationRateDegPerSec = 90.0;
+
+  /// Minimum heading change in degrees (`5°`) required before updating map rotation.
+  static const double minRotationChangeDeadbandDeg = 5.0;
+
+  /// Vertical screen position fraction from the top (`0.70` = 70% down the screen)
+  /// where the rider dot sits during RIDING follow mode.
+  static const double ridingRiderScreenFractionFromTop = 0.70;
+
+  /// Default map zoom level during active navigation.
+  static const double defaultNavigationZoom = 17.0;
+
+  /// Target zoom level when riding slowly (`<= 20 km/h`).
+  static const double zoomSlowSpeed = 17.5;
+
+  /// Target zoom level when riding fast (`>= 80 km/h`).
+  static const double zoomFastSpeed = 15.5;
+
+  /// Speed threshold in km/h at or below which [zoomSlowSpeed] applies.
+  static const double zoomLowSpeedKmh = 20.0;
+
+  /// Speed threshold in km/h at or above which [zoomFastSpeed] applies.
+  static const double zoomHighSpeedKmh = 80.0;
+
+  /// Exponential moving average smoothing factor (`alpha = 0.25`) for speed-based auto-zoom.
+  static const double zoomSmoothingAlpha = 0.25;
+
   // ── State ──────────────────────────────────────────────────────────────────
   NavigationState _state = NavigationState.idle;
   PositionData? _latestRawPosition;
@@ -187,8 +211,15 @@ class NavigationController extends ChangeNotifier {
   int? _currentSpeedKmh;
   DateTime? _lastValidSpeedTime;
   DateTime? _lastValidSpeedWallTime;
-  double? _currentHeading;
   StreamSubscription<PositionData>? _positionSub;
+
+  // RIDING follow-mode rotation, orientation, and speed-zoom state
+  double _smoothedHeadingDegrees = 0.0;
+  DateTime? _lastRotationUpdateTime;
+  bool _hasInitializedRidingHeading = false;
+  bool _isNorthUpMode = false;
+  double _smoothedZoom = defaultNavigationZoom;
+  double _viewportHeight = 800.0;
 
   PlaceSearchResult? _destination;
   final List<PlaceSearchResult> _stops = [];
@@ -210,6 +241,7 @@ class NavigationController extends ChangeNotifier {
   bool _isMuted = false;
   bool _isScreenCentered = true;
   bool _isCalculatingRoute = false;
+  bool _isAcquiringPreviewLocation = false;
   String? _routeError;
 
   bool _permissionDenied = false;
@@ -240,11 +272,6 @@ class NavigationController extends ChangeNotifier {
   final List<PlaceSearchResult> _recentPlaces = [];
   final List<PlaceSearchResult> _savedPlaces = [];
 
-  // POI Markers
-  List<PoiMarker> _poiMarkers = [];
-  PoiType? _activePoiFilter;
-  PoiMarker? _selectedPoiMarker;
-
   // Map layer toggle: false = Standard OSM, true = OpenTopoMap
   bool _isTopoLayer = false;
 
@@ -258,14 +285,148 @@ class NavigationController extends ChangeNotifier {
   /// Alias for [latestGoodPosition] so the map dot and all consumers use good fixes only.
   PositionData? get currentPosition => _latestGoodPosition;
 
+  /// Shared reliable compass heading in degrees (`0..360`, clockwise from North)
+  /// computed strictly from the last two good GPS fixes (`accuracy <= 30 m`)
+  /// that are at least [rerouteMinFixDistanceMeters] (`20 m`) apart.
+  ///
+  /// Decides whether the rider is moving (`>= 2.0 m/s`) from the distance and
+  /// time between those good fixes, NOT from the speedometer value (which shows
+  /// `"--"` when GPS is weak). Returns `null` when unreliable. Never uses the
+  /// phone's own `pos.heading` value.
+  double? get reliableHeadingDegrees {
+    final latest = _latestGoodPosition;
+    if (latest == null) return null;
+
+    PositionData? prevGoodFix;
+    double fixDistanceMeters = 0.0;
+    PositionData? immediatePrevGoodFix;
+
+    for (int i = _recentGoodFixes.length - 1; i >= 0; i--) {
+      final candidateFix = _recentGoodFixes[i];
+      if (identical(candidateFix, latest) ||
+          !candidateFix.timestamp.isBefore(latest.timestamp)) {
+        continue;
+      }
+      if (!MotionMath.isGoodAccuracy(candidateFix.accuracy)) continue;
+      immediatePrevGoodFix ??= candidateFix;
+      final dist = MotionMath.distanceMeters(candidateFix, latest);
+      if (dist >= rerouteMinFixDistanceMeters) {
+        prevGoodFix = candidateFix;
+        fixDistanceMeters = dist;
+        break;
+      }
+    }
+
+    if (prevGoodFix == null) return null;
+
+    final dtSeconds = MotionMath.elapsedSeconds(prevGoodFix, latest);
+    if (dtSeconds <= 0 ||
+        (fixDistanceMeters / dtSeconds) < rerouteBearingMinSpeedMps) {
+      return null;
+    }
+
+    // If there is a more recent good fix after prevGoodFix, verify the rider has
+    // not stopped at the current position since then.
+    if (immediatePrevGoodFix != null &&
+        !identical(immediatePrevGoodFix, prevGoodFix)) {
+      final recentDt = MotionMath.elapsedSeconds(immediatePrevGoodFix, latest);
+      if (recentDt >= 1.0) {
+        final recentDist =
+            MotionMath.distanceMeters(immediatePrevGoodFix, latest);
+        if ((recentDist / recentDt) < rerouteBearingMinSpeedMps) {
+          return null;
+        }
+      }
+    }
+
+    return RouteProgress.bearingDegrees(
+      prevGoodFix.toLatLng(),
+      latest.toLatLng(),
+    );
+  }
+
   /// Active compass heading in degrees (`0..360`).
   ///
   /// When navigating and snapped to the route (`crossTrack <= max(30 m, accuracy)`),
-  /// returns the matched route segment's bearing; otherwise returns the GPS heading.
+  /// returns the matched route segment's bearing; otherwise returns [reliableHeadingDegrees].
+  /// Never uses the phone's own `pos.heading` value.
   double? get currentHeading =>
       (_state == NavigationState.navigating && _snappedHeading != null)
           ? _snappedHeading
-          : (_currentHeading ?? _latestGoodPosition?.heading);
+          : reliableHeadingDegrees;
+
+  /// Whether the rider has toggled the map to North-up mode (`0°`) via the
+  /// compass button during active RIDING guidance.
+  bool get isNorthUpMode => _isNorthUpMode;
+
+  /// Smoothed rider compass heading in degrees (`0..360`) used by RIDING follow mode.
+  ///
+  /// Retains the last valid heading when [reliableHeadingDegrees] is `null` so the
+  /// map never spins or snaps to North when stopped.
+  double get smoothedHeadingDegrees => _smoothedHeadingDegrees;
+
+  /// Target `FlutterMap` camera rotation in degrees (`(-180..180]`).
+  ///
+  /// - In READY state (`!hasStartedMoving`), `idle`, `previewing`, `arrived`,
+  ///   or when [isNorthUpMode] is `true`, returns `0.0` (North-up).
+  /// - In RIDING follow mode, returns `-smoothedHeadingDegrees` (wrapped to
+  ///   `(-180..180]`) so the road ahead points UP on the screen.
+  double get mapRotationDegrees {
+    if (_state != NavigationState.navigating ||
+        !_hasStartedMoving ||
+        _isNorthUpMode) {
+      return 0.0;
+    }
+    final rot =
+        RouteProgress.shortestAngleDeltaDegrees(_smoothedHeadingDegrees, 0.0);
+    return rot == 0.0 ? 0.0 : rot;
+  }
+
+  /// Target map zoom level during navigation, smoothed with speed in RIDING state.
+  double get targetZoom =>
+      (_state == NavigationState.navigating && _hasStartedMoving)
+          ? _smoothedZoom
+          : defaultNavigationZoom;
+
+  /// Updates the active map viewport height in logical pixels used to offset
+  /// the camera center so the rider dot sits at 70% down the screen.
+  void setViewportHeight(double height) {
+    if (height > 0) {
+      _viewportHeight = height;
+    }
+  }
+
+  /// Computes the camera center for a given [viewportHeight] in logical pixels.
+  ///
+  /// In RIDING follow mode (`state == navigating && hasStartedMoving && isScreenCentered`),
+  /// offsets the camera center ahead of [userLatLng] along the map's current
+  /// up-bearing so the rider dot sits at [ridingRiderScreenFractionFromTop]
+  /// (`70%`) down the screen. In READY, preview, or idle states, returns the
+  /// un-offset coordinate.
+  LatLng cameraCenterForViewportHeight(double viewportHeight) {
+    final rider = userLatLng;
+    if (rider == null) {
+      return _destination?.location ?? defaultFallbackCenter;
+    }
+    if (_state == NavigationState.navigating &&
+        _hasStartedMoving &&
+        _isScreenCentered) {
+      final effectiveHeight = viewportHeight > 0 ? viewportHeight : 800.0;
+      final offsetPixels =
+          (ridingRiderScreenFractionFromTop - 0.50) * effectiveHeight;
+      final metersPerPixel =
+          (156543.033928 * math.cos(rider.latitudeInRad).abs().clamp(1e-6, 1.0)) /
+              math.pow(2.0, targetZoom);
+      final offsetMeters = offsetPixels * metersPerPixel;
+      final upBearing = _isNorthUpMode ? 0.0 : _smoothedHeadingDegrees;
+      return RouteProgress.offsetCoordinateAlongBearing(
+        origin: rider,
+        bearingDegrees: upBearing,
+        distanceMeters: offsetMeters,
+      );
+    }
+    return rider;
+  }
 
   /// Snapped coordinate on the active route polyline when `crossTrack <= max(30 m, accuracy)`,
   /// or `null` when not snapped.
@@ -322,10 +483,10 @@ class NavigationController extends ChangeNotifier {
 
   /// Centering coordinate for the map camera view.
   ///
-  /// Uses the snapped or raw good GPS fix if available, otherwise destination if set,
-  /// and falls back to [defaultFallbackCenter] strictly to position the camera overview.
-  LatLng get cameraCenter =>
-      userLatLng ?? _destination?.location ?? defaultFallbackCenter;
+  /// In RIDING follow mode, offsets the camera ahead of [userLatLng] so the rider
+  /// dot sits 70% down the screen. Otherwise uses [userLatLng], destination if set,
+  /// or [defaultFallbackCenter] strictly to position the camera overview.
+  LatLng get cameraCenter => cameraCenterForViewportHeight(_viewportHeight);
 
   /// Displayed map dot coordinate of the rider, or null if no good GPS fix is available.
   ///
@@ -349,6 +510,11 @@ class NavigationController extends ChangeNotifier {
   bool get isMuted => _isMuted;
   bool get isScreenCentered => _isScreenCentered;
   bool get isCalculatingRoute => _isCalculatingRoute;
+
+  /// True while seeding an initial GPS fix for route preview when the light
+  /// stream has not emitted a first position yet.
+  bool get isAcquiringPreviewLocation => _isAcquiringPreviewLocation;
+
   String? get routeError => _routeError;
   bool get permissionDenied => _permissionDenied;
   bool get isLocationServiceEnabled => _isLocationServiceEnabled;
@@ -381,9 +547,6 @@ class NavigationController extends ChangeNotifier {
   List<PlaceSearchResult> get recentPlaces => List.unmodifiable(_recentPlaces);
   List<PlaceSearchResult> get savedPlaces => List.unmodifiable(_savedPlaces);
 
-  List<PoiMarker> get poiMarkers => List.unmodifiable(_poiMarkers);
-  PoiType? get activePoiFilter => _activePoiFilter;
-  PoiMarker? get selectedPoiMarker => _selectedPoiMarker;
   bool get isTopoLayer => _isTopoLayer;
 
   /// Current step in turn-by-turn guidance with live countdown distance.
@@ -425,6 +588,90 @@ class NavigationController extends ChangeNotifier {
       return _route!.steps[nextIndex];
     }
     return null;
+  }
+
+  /// Next maneuver step on the active route where the map draws the white
+  /// turn-arrow marker.
+  ///
+  /// Uses existing route step data (`nextStep` when it is an upcoming turn
+  /// before destination arrival, or `currentStep` when it is an active turn).
+  RouteStep? get nextManeuverStep {
+    if (_route == null || _route!.steps.isEmpty) return null;
+    final next = nextStep;
+    if (next != null && next.maneuverType.toLowerCase() != 'arrive') {
+      return next;
+    }
+    final current = currentStep;
+    if (current != null &&
+        current.maneuverType.toLowerCase() != 'depart' &&
+        current.maneuverType.toLowerCase() != 'arrive') {
+      return current;
+    }
+    return next ?? current;
+  }
+
+  /// Portion of the active route polyline that the rider has already passed
+  /// (`0.._alongRouteDistanceMeters`), rendered in grey on the map.
+  List<LatLng> get passedRoutePolyline {
+    final poly = _route?.polyline;
+    if (poly == null ||
+        poly.length < 2 ||
+        _state != NavigationState.navigating ||
+        _alongRouteDistanceMeters <= 0.0 ||
+        _routeCumulativeDistances.length != poly.length) {
+      return const [];
+    }
+    final splitIndex = RouteProgress.findSegmentIndexAtDistance(
+      _routeCumulativeDistances,
+      _alongRouteDistanceMeters,
+    );
+    final splitPoint = _snappedPosition ??
+        RouteProgress.interpolateAtDistance(
+          poly,
+          _routeCumulativeDistances,
+          _alongRouteDistanceMeters,
+        );
+    final passed = <LatLng>[
+      for (int i = 0; i <= splitIndex; i++) poly[i],
+    ];
+    if (MotionMath.distanceBetweenPoints(passed.last, splitPoint) > 0.5) {
+      passed.add(splitPoint);
+    }
+    return passed.length >= 2 ? passed : const [];
+  }
+
+  /// Portion of the active route polyline ahead of the rider, rendered in
+  /// outlined tactical orange on the map.
+  List<LatLng> get activeRoutePolyline {
+    final poly = _route?.polyline;
+    if (poly == null || poly.isEmpty) return const [];
+    if (_state != NavigationState.navigating ||
+        _alongRouteDistanceMeters <= 0.0 ||
+        _routeCumulativeDistances.length != poly.length ||
+        poly.length < 2) {
+      return poly;
+    }
+    final splitIndex = RouteProgress.findSegmentIndexAtDistance(
+      _routeCumulativeDistances,
+      _alongRouteDistanceMeters,
+    );
+    final splitPoint = _snappedPosition ??
+        RouteProgress.interpolateAtDistance(
+          poly,
+          _routeCumulativeDistances,
+          _alongRouteDistanceMeters,
+        );
+    final ahead = <LatLng>[splitPoint];
+    for (int i = splitIndex + 1; i < poly.length; i++) {
+      if (MotionMath.distanceBetweenPoints(ahead.last, poly[i]) > 0.5 ||
+          i == poly.length - 1) {
+        ahead.add(poly[i]);
+      }
+    }
+    if (ahead.length == 1) {
+      ahead.add(poly.last);
+    }
+    return ahead;
   }
 
   /// Current filtered, smoothed speed in km/h, or `null` when no trustworthy
@@ -614,31 +861,80 @@ class NavigationController extends ChangeNotifier {
     _currentLocationSubtitle = 'GPS Ready';
     notifyListeners();
 
-    // Fetch single current position fix
-    final initialPos = await _locationService.getCurrentPosition();
+    await _seedPositionIfNeeded(checkServiceAndPermission: false);
     if (_disposed) return;
-    if (initialPos != null) {
-      _latestRawPosition = initialPos;
-      _firstRawFixTime ??= initialPos.timestamp;
-      if (MotionMath.isGoodFix(initialPos)) {
-        _latestGoodPosition = initialPos;
-        _lastGoodFixWallTime = DateTime.now();
-        _currentHeading = initialPos.heading;
-      }
+    if (_latestGoodPosition != null) {
       notifyListeners();
     }
 
     startPositionStream();
   }
 
+  /// Seeds [_latestGoodPosition] via one-off current or OS last-known lookup
+  /// when the passive `light` stream (10 m distanceFilter) has not emitted yet.
+  /// Leaves [_latestGoodPosition] null when location services are disabled,
+  /// permission is denied, or no valid fix is available.
+  Future<void> _seedPositionIfNeeded({
+    required bool checkServiceAndPermission,
+  }) async {
+    if (_latestGoodPosition != null || _disposed) return;
+
+    if (checkServiceAndPermission) {
+      final serviceEnabled = await _locationService.isLocationServiceEnabled();
+      if (_disposed) return;
+      _isLocationServiceEnabled = serviceEnabled;
+      if (!serviceEnabled) return;
+
+      final hasPerm = await _locationService.checkPermission();
+      if (_disposed) return;
+      if (!hasPerm) return;
+    }
+
+    PositionData? candidate;
+    try {
+      candidate = await _locationService.getCurrentPosition();
+    } catch (_) {}
+    if (_disposed) return;
+
+    if (candidate == null || !MotionMath.isGoodFix(candidate)) {
+      try {
+        final lastKnown = await _locationService.getLastKnownPosition();
+        if (lastKnown != null && !_disposed) {
+          candidate ??= lastKnown;
+          if (MotionMath.isGoodFix(lastKnown)) {
+            candidate = lastKnown;
+          }
+        }
+      } catch (_) {}
+    }
+
+    // Reuse a live position already acquired by CurrentPlaceController if still needed.
+    if ((candidate == null || !MotionMath.isGoodFix(candidate)) &&
+        _currentPlaceController.lastKnownPosition != null &&
+        !_currentPlaceController.isLastKnownFromCache &&
+        MotionMath.isGoodFix(_currentPlaceController.lastKnownPosition!)) {
+      candidate = _currentPlaceController.lastKnownPosition;
+    }
+
+    if (candidate != null && !_disposed) {
+      _latestRawPosition = candidate;
+      _firstRawFixTime ??= candidate.timestamp;
+      if (MotionMath.isGoodFix(candidate)) {
+        _latestGoodPosition = candidate;
+        _lastGoodFixWallTime = DateTime.now();
+      }
+    }
+  }
+
   void startPositionStream() {
     _positionSub?.cancel();
-    final isNav = _state == NavigationState.navigating;
+    final bool isNavigating = _state == NavigationState.navigating;
     _positionSub = _locationService
         .getPositionStream(
-          highAccuracy: isNav,
+          highAccuracy: isNavigating,
           forceLocationManager:
               SettingsController.instance.gpsOnlyLocationProvider,
+          owner: LocationStreamOwner.navigation,
         )
         .listen(_handlePositionUpdate);
   }
@@ -684,10 +980,7 @@ class NavigationController extends ChangeNotifier {
 
     _updateSpeedFromGoodFix(pos);
     _updateMovingState(pos.timestamp);
-
-    if (pos.heading != null && pos.heading! >= 0) {
-      _currentHeading = pos.heading;
-    }
+    _updateCameraFollowMetrics(pos);
 
     if (_state == NavigationState.navigating && _route != null) {
       _processNavigationStepProgression(pos);
@@ -847,6 +1140,62 @@ class NavigationController extends ChangeNotifier {
       }
     } else {
       _movingStartTime = null;
+    }
+  }
+
+  /// Updates the smoothed heading-up map rotation and speed-based auto-zoom
+  /// during active RIDING guidance.
+  ///
+  /// - Uses [reliableHeadingDegrees] (from the last two good fixes >= 20 m apart).
+  /// - When [reliableHeadingDegrees] is `null`, keeps the last rotation without
+  ///   spinning or snapping to North.
+  /// - Turns by the shortest angle, ignores changes under `5°`, and limits turn
+  ///   rate to `90°/s`.
+  /// - Adjusts zoom modestly with speed (`17.5` when slow `<= 20 km/h` down to
+  ///   `15.5` when fast `>= 80 km/h`), smoothed with EMA, and never modifies
+  ///   zoom while the rider is interacting (`!isScreenCentered`).
+  void _updateCameraFollowMetrics(PositionData pos) {
+    if (_state != NavigationState.navigating || !_hasStartedMoving) {
+      return;
+    }
+
+    final targetHeading = reliableHeadingDegrees;
+    if (targetHeading != null) {
+      if (!_hasInitializedRidingHeading) {
+        _smoothedHeadingDegrees = (targetHeading % 360.0 + 360.0) % 360.0;
+        _hasInitializedRidingHeading = true;
+      } else {
+        final dt = _lastRotationUpdateTime != null
+            ? MotionMath.elapsedSecondsBetween(
+                _lastRotationUpdateTime!,
+                pos.timestamp,
+              )
+            : 1.0;
+        if (dt > 0.0) {
+          _smoothedHeadingDegrees = RouteProgress.stepSmoothedHeadingDegrees(
+            currentHeadingDegrees: _smoothedHeadingDegrees,
+            targetHeadingDegrees: targetHeading,
+            dtSeconds: dt,
+            maxTurnRateDegPerSec: maxRotationRateDegPerSec,
+            deadbandDegrees: minRotationChangeDeadbandDeg,
+          );
+        }
+      }
+    }
+    _lastRotationUpdateTime = pos.timestamp;
+
+    // Speed-based auto-zoom: never changed while the rider is interacting (!isScreenCentered).
+    if (_isScreenCentered) {
+      final speedKmh = currentSpeed?.toDouble();
+      if (speedKmh != null) {
+        final fraction = ((speedKmh - zoomLowSpeedKmh) /
+                (zoomHighSpeedKmh - zoomLowSpeedKmh))
+            .clamp(0.0, 1.0);
+        final rawZoom =
+            zoomSlowSpeed - fraction * (zoomSlowSpeed - zoomFastSpeed);
+        _smoothedZoom = (zoomSmoothingAlpha * rawZoom) +
+            ((1.0 - zoomSmoothingAlpha) * _smoothedZoom);
+      }
     }
   }
 
@@ -1035,32 +1384,10 @@ class NavigationController extends ChangeNotifier {
     _lastRerouteAttemptWallTime = DateTime.now();
 
     final currentLoc = pos.toLatLng();
-    final speedMps = _smoothedSpeedMps ??
-        ((pos.speed != null && pos.speed! > 0) ? pos.speed! : 0.0);
 
-    // Derive reroute heading strictly from the last two good GPS fixes (accuracy <= 30 m)
-    // that are at least 20 m apart. The phone never reports a reliable heading (often 0.0),
-    // so we never use raw phone heading or a fake 0.0 fallback.
-    PositionData? prevGoodFix;
-    for (int i = _recentGoodFixes.length - 1; i >= 0; i--) {
-      final candidateFix = _recentGoodFixes[i];
-      if (identical(candidateFix, pos) ||
-          candidateFix.timestamp.isAfter(pos.timestamp)) {
-        continue;
-      }
-      if (!MotionMath.isGoodAccuracy(candidateFix.accuracy)) continue;
-      final dist = MotionMath.distanceMeters(candidateFix, pos);
-      if (dist >= rerouteMinFixDistanceMeters) {
-        prevGoodFix = candidateFix;
-        break;
-      }
-    }
-
-    // Treat heading as unreliable if speed is under 2 m/s or no two good fixes >= 20 m apart exist.
-    final double? rerouteHeading =
-        (speedMps >= rerouteBearingMinSpeedMps && prevGoodFix != null)
-            ? RouteProgress.bearingDegrees(prevGoodFix.toLatLng(), currentLoc)
-            : null;
+    // Use the single shared reliableHeadingDegrees getter (computed from the last
+    // two good fixes >= 20 m apart moving >= 2.0 m/s; never phone heading).
+    final double? rerouteHeading = reliableHeadingDegrees;
     final String headingSource =
         rerouteHeading != null ? 'from last good fixes' : 'none';
 
@@ -1291,22 +1618,15 @@ class NavigationController extends ChangeNotifier {
     _addRecentPlace(destinationPlace);
     _routeError = null;
     _state = NavigationState.previewing;
+    _isAcquiringPreviewLocation = _latestGoodPosition == null;
+    startPositionStream();
     notifyListeners();
 
     if (_latestGoodPosition == null) {
-      try {
-        final pos = await _locationService.getCurrentPosition();
-        if (pos != null && !_disposed) {
-          _latestRawPosition = pos;
-          _firstRawFixTime ??= pos.timestamp;
-          if (MotionMath.isGoodFix(pos)) {
-            _latestGoodPosition = pos;
-            _lastGoodFixWallTime = DateTime.now();
-            _currentHeading = pos.heading;
-          }
-        }
-      } catch (_) {}
+      await _seedPositionIfNeeded(checkServiceAndPermission: true);
     }
+    _isAcquiringPreviewLocation = false;
+    if (_disposed) return;
 
     await calculateRoute();
   }
@@ -1316,6 +1636,16 @@ class NavigationController extends ChangeNotifier {
   /// cannot be computed and are NEVER calculated from the Lahore fallback center.
   Future<void> calculateRoute() async {
     if (_destination == null) return;
+
+    // Seed once on Retry if light stream (10 m filter) hasn't emitted yet while stationary.
+    if (_latestGoodPosition == null) {
+      _isAcquiringPreviewLocation = true;
+      _routeError = null;
+      notifyListeners();
+      await _seedPositionIfNeeded(checkServiceAndPermission: true);
+      _isAcquiringPreviewLocation = false;
+      if (_disposed) return;
+    }
 
     // Strict safety check: fallback center must never be used as rider origin or in ETA/distance.
     if (_latestGoodPosition == null) {
@@ -1380,6 +1710,11 @@ class NavigationController extends ChangeNotifier {
     _state = NavigationState.navigating;
     _hasStartedMoving = false;
     _movingStartTime = null;
+    _smoothedHeadingDegrees = 0.0;
+    _lastRotationUpdateTime = null;
+    _hasInitializedRidingHeading = false;
+    _isNorthUpMode = false;
+    _smoothedZoom = defaultNavigationZoom;
     _isRerouteFailed = false;
     _offRouteConsecutiveFixes = 0;
     _offRouteFirstFixTime = null;
@@ -1444,6 +1779,11 @@ class NavigationController extends ChangeNotifier {
     _state = NavigationState.idle;
     _hasStartedMoving = false;
     _movingStartTime = null;
+    _smoothedHeadingDegrees = 0.0;
+    _lastRotationUpdateTime = null;
+    _hasInitializedRidingHeading = false;
+    _isNorthUpMode = false;
+    _smoothedZoom = defaultNavigationZoom;
     _isRerouteFailed = false;
     _route = null;
     _routeCumulativeDistances = const [];
@@ -1477,10 +1817,16 @@ class NavigationController extends ChangeNotifier {
     _state = NavigationState.idle;
     _hasStartedMoving = false;
     _movingStartTime = null;
+    _smoothedHeadingDegrees = 0.0;
+    _lastRotationUpdateTime = null;
+    _hasInitializedRidingHeading = false;
+    _isNorthUpMode = false;
+    _smoothedZoom = defaultNavigationZoom;
     _isRerouteFailed = false;
     _route = null;
     _destination = null;
     _stops.clear();
+    startPositionStream();
     notifyListeners();
   }
 
@@ -1494,7 +1840,17 @@ class NavigationController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Restores camera follow mode (heading-up with rider dot 70% down in RIDING state).
   void recenterMap() {
+    _isScreenCentered = true;
+    _isNorthUpMode = false;
+    notifyListeners();
+  }
+
+  /// Toggles the map orientation between heading-up (follow) and North-up (`0°`)
+  /// when the compass button is tapped, and resumes camera follow.
+  void toggleCompassMode() {
+    _isNorthUpMode = !_isNorthUpMode;
     _isScreenCentered = true;
     notifyListeners();
   }
@@ -1596,56 +1952,6 @@ class NavigationController extends ChangeNotifier {
     return _savedPlaces.any((p) => p.name == place.name);
   }
 
-  // ── POI Markers ────────────────────────────────────────────────────────────
-
-  /// Toggles display of POI markers for the given [type].
-  /// Does not fetch POIs if GPS fix is unavailable.
-  Future<void> togglePoiFilter(PoiType type) async {
-    if (_activePoiFilter == type) {
-      _activePoiFilter = null;
-      _poiMarkers = [];
-      _selectedPoiMarker = null;
-      notifyListeners();
-      return;
-    }
-
-    _activePoiFilter = type;
-    _selectedPoiMarker = null;
-    notifyListeners();
-
-    if (_latestGoodPosition == null) {
-      _poiMarkers = [];
-      notifyListeners();
-      return;
-    }
-
-    final pos = _latestGoodPosition!.toLatLng();
-    switch (type) {
-      case PoiType.mechanic:
-        _poiMarkers = _placesPoiService.fetchNearbyMechanics(
-          pos,
-          currentLocationName,
-        );
-        break;
-      case PoiType.fuel:
-        _poiMarkers = await _placesPoiService.fetchFuelStations(pos);
-        break;
-      case PoiType.restStop:
-        _poiMarkers = await _placesPoiService.fetchRestStops(pos);
-        break;
-    }
-    notifyListeners();
-  }
-
-  void selectPoiMarker(PoiMarker marker) {
-    _selectedPoiMarker = marker;
-    notifyListeners();
-  }
-
-  void clearSelectedPoiMarker() {
-    _selectedPoiMarker = null;
-    notifyListeners();
-  }
 
   // ── Geocoding ──────────────────────────────────────────────────────────────
 
